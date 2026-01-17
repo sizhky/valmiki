@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 
 from fasthtml.common import *
+from starlette.requests import Request
+from starlette.responses import RedirectResponse
 
 from .scraper import SargaReader
 
@@ -14,6 +16,7 @@ rt = app.route
 # In-memory storage
 sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
+DEFAULT_LANGUAGE = 'te'
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -33,141 +36,438 @@ def _get_conn():
 def _init_db():
     """Initialize SQLite schema if needed."""
     with _get_conn() as conn:
+        conn.execute('PRAGMA foreign_keys = ON')
         conn.execute(
             '''
-            CREATE TABLE IF NOT EXISTS bookmarks (
+            CREATE TABLE IF NOT EXISTS reading_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                language TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS thread_progress (
+                thread_id INTEGER PRIMARY KEY,
                 kanda INTEGER NOT NULL,
                 sarga INTEGER NOT NULL,
                 sloka_num INTEGER NOT NULL,
-                PRIMARY KEY (kanda, sarga, sloka_num)
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (thread_id) REFERENCES reading_threads(id) ON DELETE CASCADE
             )
             '''
         )
         conn.execute(
             '''
-            CREATE TABLE IF NOT EXISTS last_read (
-                language TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS thread_bookmarks (
+                thread_id INTEGER NOT NULL,
                 kanda INTEGER NOT NULL,
                 sarga INTEGER NOT NULL,
-                sloka_num INTEGER NOT NULL
+                sloka_num INTEGER NOT NULL,
+                PRIMARY KEY (thread_id, kanda, sarga, sloka_num),
+                FOREIGN KEY (thread_id) REFERENCES reading_threads(id) ON DELETE CASCADE
             )
             '''
         )
 
 
-def _is_bookmarked(kanda: int, sarga: int, sloka_num: int) -> bool:
+def _next_thread_name() -> str:
     with _get_conn() as conn:
         row = conn.execute(
-            'SELECT 1 FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
-            (kanda, sarga, sloka_num),
+            'SELECT COUNT(*) AS count FROM reading_threads',
+        ).fetchone()
+    count = int(row['count']) if row else 0
+    return f'Thread {count + 1}'
+
+
+def _create_thread(name: str | None, kanda: int, sarga: int, sloka_num: int) -> int:
+    thread_name = name.strip() if name else ''
+    if not thread_name:
+        thread_name = _next_thread_name()
+    with _get_conn() as conn:
+        thread_id = conn.execute(
+            'INSERT INTO reading_threads (name, language) VALUES (?, ?)',
+            (thread_name, DEFAULT_LANGUAGE),
+        ).lastrowid
+        conn.execute(
+            '''
+            INSERT INTO thread_progress (thread_id, kanda, sarga, sloka_num)
+            VALUES (?, ?, ?, ?)
+            ''',
+            (thread_id, kanda, sarga, sloka_num),
+        )
+    return int(thread_id)
+
+
+def _ensure_default_thread() -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT id FROM reading_threads ORDER BY id LIMIT 1',
+        ).fetchone()
+    if row:
+        return int(row['id'])
+    return _create_thread(None, 1, 1, 1)
+
+
+def _get_thread(thread_id: int):
+    with _get_conn() as conn:
+        return conn.execute(
+            'SELECT id, name, language FROM reading_threads WHERE id = ?',
+            (thread_id,),
+        ).fetchone()
+
+
+def _rename_thread(thread_id: int, name: str) -> None:
+    clean_name = name.strip()
+    if not clean_name:
+        return
+    with _get_conn() as conn:
+        conn.execute(
+            'UPDATE reading_threads SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            (clean_name, thread_id),
+        )
+
+
+def _update_progress(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            INSERT INTO thread_progress (thread_id, kanda, sarga, sloka_num)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                kanda = excluded.kanda,
+                sarga = excluded.sarga,
+                sloka_num = excluded.sloka_num,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (thread_id, kanda, sarga, sloka_num),
+        )
+        conn.execute(
+            'UPDATE reading_threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+            (thread_id,),
+        )
+
+
+def _get_threads():
+    with _get_conn() as conn:
+        rows = conn.execute(
+            '''
+            SELECT t.id, t.name, t.language, p.kanda, p.sarga, p.sloka_num, p.updated_at
+            FROM reading_threads t
+            LEFT JOIN thread_progress p ON p.thread_id = t.id
+            ORDER BY p.updated_at DESC, t.id DESC
+            '''
+        ).fetchall()
+    return rows
+
+
+def _ensure_legacy_bookmarks() -> None:
+    with _get_conn() as conn:
+        legacy_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'"
+        ).fetchone()
+        if not legacy_table:
+            return
+        legacy_count = conn.execute('SELECT COUNT(*) AS count FROM bookmarks').fetchone()
+        if not legacy_count or int(legacy_count['count']) == 0:
+            return
+        current_count = conn.execute(
+            '''
+            SELECT COUNT(*) AS count
+            FROM thread_bookmarks tb
+            JOIN reading_threads t ON t.id = tb.thread_id
+            ''',
+        ).fetchone()
+        if current_count and int(current_count['count']) > 0:
+            return
+        thread_id = conn.execute(
+            'INSERT INTO reading_threads (name, language) VALUES (?, ?)',
+            ('Legacy Bookmarks', DEFAULT_LANGUAGE),
+        ).lastrowid
+        conn.execute(
+            'INSERT INTO thread_progress (thread_id, kanda, sarga, sloka_num) VALUES (?, 1, 1, 1)',
+            (thread_id,),
+        )
+        conn.execute(
+            '''
+            INSERT OR IGNORE INTO thread_bookmarks (thread_id, kanda, sarga, sloka_num)
+            SELECT ?, kanda, sarga, sloka_num FROM bookmarks
+            ''',
+            (thread_id,),
+        )
+
+
+def _is_bookmarked(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            '''
+            SELECT 1 FROM thread_bookmarks
+            WHERE thread_id = ? AND kanda = ? AND sarga = ? AND sloka_num = ?
+            ''',
+            (thread_id, kanda, sarga, sloka_num),
         ).fetchone()
     return row is not None
 
 
-def _toggle_bookmark(kanda: int, sarga: int, sloka_num: int) -> bool:
+def _toggle_bookmark(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> bool:
     with _get_conn() as conn:
         row = conn.execute(
-            'SELECT 1 FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
-            (kanda, sarga, sloka_num),
+            '''
+            SELECT 1 FROM thread_bookmarks
+            WHERE thread_id = ? AND kanda = ? AND sarga = ? AND sloka_num = ?
+            ''',
+            (thread_id, kanda, sarga, sloka_num),
         ).fetchone()
         if row:
             conn.execute(
-                'DELETE FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
-                (kanda, sarga, sloka_num),
+                '''
+                DELETE FROM thread_bookmarks
+                WHERE thread_id = ? AND kanda = ? AND sarga = ? AND sloka_num = ?
+                ''',
+                (thread_id, kanda, sarga, sloka_num),
             )
             return False
         conn.execute(
-            'INSERT INTO bookmarks (kanda, sarga, sloka_num) VALUES (?, ?, ?)',
-            (kanda, sarga, sloka_num),
+            '''
+            INSERT INTO thread_bookmarks (thread_id, kanda, sarga, sloka_num)
+            VALUES (?, ?, ?, ?)
+            ''',
+            (thread_id, kanda, sarga, sloka_num),
         )
         return True
 
 
-def _get_bookmarks():
+def _get_thread_bookmarks(thread_id: int | None = None):
+    _ensure_legacy_bookmarks()
+    params: list[object] = []
+    clause = ''
+    if thread_id is not None:
+        clause = 'WHERE t.id = ?'
+        params.append(thread_id)
     with _get_conn() as conn:
         rows = conn.execute(
-            'SELECT kanda, sarga, sloka_num FROM bookmarks ORDER BY kanda, sarga, sloka_num'
-        ).fetchall()
-    return [(int(r['kanda']), int(r['sarga']), int(r['sloka_num'])) for r in rows]
-
-
-def _set_last_read(language: str, kanda: int, sarga: int, sloka_num: int) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            '''
-            INSERT INTO last_read (language, kanda, sarga, sloka_num)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(language) DO UPDATE SET
-                kanda = excluded.kanda,
-                sarga = excluded.sarga,
-                sloka_num = excluded.sloka_num
+            f'''
+            SELECT t.id AS thread_id, t.name AS thread_name,
+                   tb.kanda, tb.sarga, tb.sloka_num
+            FROM thread_bookmarks tb
+            JOIN reading_threads t ON t.id = tb.thread_id
+            {clause}
+            ORDER BY t.name, tb.kanda, tb.sarga, tb.sloka_num
             ''',
-            (language, kanda, sarga, sloka_num),
-        )
-
-
-def _get_last_read():
-    with _get_conn() as conn:
-        rows = conn.execute(
-            'SELECT language, kanda, sarga, sloka_num FROM last_read'
+            params,
         ).fetchall()
-    return {r['language']: (int(r['kanda']), int(r['sarga']), int(r['sloka_num'])) for r in rows}
+    return rows
+
+
+def _parse_thread_id(request: Request) -> int | None:
+    raw = request.query_params.get('thread')
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _resolve_thread_id(thread_id: int | None) -> int:
+    if thread_id is not None:
+        thread = _get_thread(thread_id)
+        if thread:
+            return int(thread['id'])
+    return _ensure_default_thread()
+
+
+def _with_thread(url: str, thread_id: int) -> str:
+    return f'{url}?thread={thread_id}'
+
+
+def _parse_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _thread_title_fragment(thread_id: int, title: str):
+    return Div(
+        H3(
+            title,
+            style='color:white; font-size:1.2em; cursor:pointer',
+            **{
+                'hx-get': f'/threads/{thread_id}/rename-form',
+                'hx-target': f'#thread-title-{thread_id}',
+                'hx-swap': 'outerHTML',
+            },
+        ),
+        id=f'thread-title-{thread_id}',
+    )
+
+
+def _thread_rename_form_fragment(thread_id: int, title: str):
+    return Form(
+        Input(
+            type='text',
+            name='name',
+            value=title,
+            autofocus='true',
+            style='padding:6px 8px; width:100%; border-radius:6px; border:1px solid #333; background:#0f0f0f; color:white',
+        ),
+        Div(
+            Button('Save', type='submit',
+                   style='padding:6px 10px; border:none; border-radius:6px; background:#fbbf24; color:black; cursor:pointer'),
+            Button(
+                'Cancel',
+                type='button',
+                style='padding:6px 10px; border:none; border-radius:6px; background:#2d2d2d; color:#fbbf24; cursor:pointer',
+                **{
+                    'hx-get': f'/threads/{thread_id}/title',
+                    'hx-target': f'#thread-title-{thread_id}',
+                    'hx-swap': 'outerHTML',
+                },
+            ),
+            style='display:flex; gap:8px; margin-top:8px',
+        ),
+        id=f'thread-title-{thread_id}',
+        action=f'/threads/{thread_id}/rename',
+        method='post',
+        **{
+            'hx-post': f'/threads/{thread_id}/rename',
+            'hx-target': f'#thread-title-{thread_id}',
+            'hx-swap': 'outerHTML',
+        },
+    )
+
+
+def _thread_card_fragment(thread):
+    k = thread['kanda']
+    s = thread['sarga']
+    sl = thread['sloka_num']
+    if k is None or s is None or sl is None:
+        resume_url = _with_thread('/kanda/1/sarga/1/sloka/1', thread['id'])
+        progress_text = 'No progress yet'
+    else:
+        resume_url = _with_thread(f'/kanda/{k}/sarga/{s}/sloka/{sl}', thread['id'])
+        progress_text = f'Kanda {k} Sarga {s} Sloka {sl}'
+
+    return Div(
+        Div(
+            _thread_title_fragment(thread['id'], thread['name']),
+            P(progress_text, style='color:#ccc; margin-top:8px'),
+            style='flex:1'
+        ),
+        Div(
+            A('Resume', href=resume_url,
+              style='display:inline-block; padding:8px 12px; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:6px; font-size:0.95em; margin-right:8px'),
+            A('Bookmarks', href=_with_thread('/bookmarks', thread['id']),
+              style='display:inline-block; padding:8px 12px; background:#1a1a1a; color:#fbbf24; text-decoration:none; border-radius:6px; font-size:0.95em'),
+            Button(
+                'Delete',
+                type='button',
+                style='display:inline-block; padding:8px 12px; background:#3a1a1a; color:#fbbf24; border:none; border-radius:6px; font-size:0.95em; cursor:pointer',
+                **{
+                    'hx-post': f'/threads/{thread["id"]}/delete',
+                    'hx-target': f'#thread-card-{thread["id"]}',
+                    'hx-swap': 'outerHTML',
+                    'hx-confirm': 'Delete this thread?',
+                },
+            ),
+            style='display:flex; gap:8px; align-items:center'
+        ),
+        id=f'thread-card-{thread["id"]}',
+        style='padding:16px; background:#111; border:1px solid #222; border-radius:10px; margin-bottom:16px'
+    )
 
 
 _init_db()
 
 
+@rt('/threads/new')
+def new_thread(request: Request):
+    """Create a new reading thread and redirect to its start."""
+    name = request.query_params.get('name', '')
+    kanda = _parse_int(request.query_params.get('kanda'), 1)
+    sarga = _parse_int(request.query_params.get('sarga'), 1)
+    sloka_num = _parse_int(request.query_params.get('sloka'), 1)
+    thread_id = _create_thread(name, kanda, sarga, sloka_num)
+    return RedirectResponse(
+        _with_thread(f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}', thread_id)
+    )
+
+
+@rt('/threads/{thread_id}/rename')
+async def rename_thread(thread_id: int, request: Request):
+    """Rename an existing reading thread."""
+    form = await request.form()
+    name = str(form.get('name', '')).strip()
+    _rename_thread(thread_id, name)
+    thread = _get_thread(thread_id)
+    if not thread:
+        return Response('', status_code=404)
+    return _thread_title_fragment(thread_id, thread['name'])
+
+
+@rt('/threads/{thread_id}/rename-form')
+def rename_thread_form(thread_id: int):
+    """Return inline rename form."""
+    thread = _get_thread(thread_id)
+    if not thread:
+        return Response('', status_code=404)
+    return _thread_rename_form_fragment(thread_id, thread['name'])
+
+
+@rt('/threads/{thread_id}/title')
+def thread_title(thread_id: int):
+    """Return thread title fragment."""
+    thread = _get_thread(thread_id)
+    if not thread:
+        return Response('', status_code=404)
+    return _thread_title_fragment(thread_id, thread['name'])
+
+
+@rt('/threads/{thread_id}/delete', methods=['POST'])
+def delete_thread(thread_id: int):
+    """Delete a reading thread."""
+    with _get_conn() as conn:
+        conn.execute('DELETE FROM reading_threads WHERE id = ?', (thread_id,))
+    return Response('')
+
+
 @rt('/')
 def home():
-    """Home page with continue reading links."""
-    links = []
-    
-    # Add continue reading links for each language with history
-    for lang, (k, s, sl) in _get_last_read().items():
-        if lang == 'te':
-            link_text = f'చదవడం కొనసాగించండి - కాండ {k} సర్గ {s} శ్లోక {sl}'
-        elif lang == 'tg':
-            link_text = f'చదువుకోడం కొనసాగించు - కాండ {k} సర్గ {s} శ్లోక {sl}'
-        else:  # en
-            link_text = f'Continue Reading - Kanda {k} Sarga {s} Sloka {sl}'
-        
-        links.append(
-            A(link_text, 
-              href=f'/{lang}/kanda/{k}/sarga/{s}/sloka/{sl}',
-              style='display:block; padding:15px; margin:10px 0; background:#1a1a1a; color:white; text-decoration:none; border-radius:8px; font-size:1.2em')
-        )
-    
-    # Start reading links
-    start_links = [
-        A('Start Reading (Telugu)', href='/te/kanda/1/sarga/1/sloka/1', 
-          style='display:block; padding:15px; margin:10px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.1em'),
-        A('Start Reading (English)', href='/en/kanda/1/sarga/1/sloka/1',
-          style='display:block; padding:15px; margin:10px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.1em'),
+    """Home page with reading threads."""
+    threads = _get_threads()
+    thread_cards = []
+
+    for thread in threads:
+        thread_cards.append(_thread_card_fragment(thread))
+
+    new_thread_links = [
+        A('New Reading Thread', href='/threads/new',
+          style='display:block; padding:12px 14px; margin:8px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
     ]
 
-    # Bookmarks links
-    bookmarks_links = [
-        A('Visit Bookmarks (Telugu)', href='/te/bookmarks',
-          style='display:block; padding:15px; margin:10px 0; background:#1a1a1a; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
-        A('Visit Bookmarks (English)', href='/en/bookmarks',
-          style='display:block; padding:15px; margin:10px 0; background:#1a1a1a; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
-    ]
-    
     return Html(
         Head(
             Title('Valmiki Ramayana Reader'),
-            Style('* { margin:0; padding:0; box-sizing:border-box; }')
+            Style('* { margin:0; padding:0; box-sizing:border-box; }'),
+            Script(src='https://unpkg.com/htmx.org@1.9.12')
         ),
         Body(
             Div(
                 H1('వాల్మీకి రామాయణం', style='text-align:center; color:#fbbf24; padding:30px; font-size:2.5em'),
                 H2('Valmiki Ramayana Reader', style='text-align:center; color:#888; padding:10px; font-size:1.5em'),
                 Div(
-                    *links if links else [P('No reading history yet', style='text-align:center; color:#888; padding:20px')],
+                    H3('Your Reading Threads', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
+                    *thread_cards if thread_cards else [P('No threads yet', style='text-align:center; color:#888; padding:20px')],
                     Hr(style='border:none; border-top:1px solid #333; margin:30px 0'),
-                    *start_links,
-                    *bookmarks_links,
-                    style='max-width:600px; margin:0 auto; padding:20px'
+                    H3('Start a New Thread', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
+                    *new_thread_links,
+                    style='max-width:700px; margin:0 auto; padding:20px'
                 ),
                 style='min-height:100vh; background:black'
             )
@@ -175,12 +475,10 @@ def home():
     )
 
 
-@rt('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}')
-async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
+@rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}')
+async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Display a single sloka with navigation."""
-    # Validate language
-    if language not in ['en', 'te', 'tg']:
-        return Response('Invalid language', status_code=404)
+    thread_id = _resolve_thread_id(_parse_thread_id(request))
     
     # Get or create SargaReader for this sarga
     sr = sarga_readers.get((kanda, sarga))
@@ -203,7 +501,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
     
     # Calculate previous URL
     if sloka_num > 1:
-        prev_url = f'/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num-1}'
+        prev_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num-1}'
     else:
         # Need to go to previous sarga
         if sarga > 1:
@@ -214,31 +512,31 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
                     sarga_readers[(kanda, sarga-1)] = prev_sr
                 except:
                     prev_sr = None
-            prev_url = f'/{language}/kanda/{kanda}/sarga/{sarga-1}/sloka/{len(prev_sr)}' if prev_sr else '#'
+            prev_url = f'/kanda/{kanda}/sarga/{sarga-1}/sloka/{len(prev_sr)}' if prev_sr else '#'
         else:
             prev_url = '#'
     
     # Calculate next URL
     if sloka_num < len(sr):
-        next_url = f'/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num+1}'
+        next_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num+1}'
     else:
         # Go to next sarga (assume it exists)
-        next_url = f'/{language}/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
+        next_url = f'/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
+
+    if prev_url != '#':
+        prev_url = _with_thread(prev_url, thread_id)
+    if next_url != '#':
+        next_url = _with_thread(next_url, thread_id)
     
     # Render sloka content
     sloka_text = sloka_data['sloka_text']
     bhaavam_en = sloka_data['bhaavam_en']
     
-    # Get translated bhaavam if not English
-    if language == 'te':
-        bhaavam = translation_cache['te'].get(bhaavam_en, bhaavam_en)
-    elif language == 'tg':
-        bhaavam = translation_cache['tg'].get(bhaavam_en, bhaavam_en)
-    else:
-        bhaavam = bhaavam_en
+    # English translation (Telugu sloka shown above)
+    bhaavam = bhaavam_en
     
     # Check if bookmarked
-    is_bookmarked = _is_bookmarked(kanda, sarga, sloka_num)
+    is_bookmarked = _is_bookmarked(thread_id, kanda, sarga, sloka_num)
     bookmark_fill = '#fbbf24' if is_bookmarked else 'none'
     
     # Bookmark icon SVG
@@ -303,7 +601,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
                 Span('🔄', style='font-size:1.5em'),
                 Div(
                     Div('Rotate your device for better reading', style='font-weight:600'),
-                    Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి', style='font-size:0.9em; margin-top:4px; opacity:0.95') if language in ['te', 'tg'] else None,
+                    Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి', style='font-size:0.9em; margin-top:4px; opacity:0.95'),
                     style='line-height:1.3'
                 ),
                 cls='rotation-hint'
@@ -312,7 +610,9 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
             # Top-right controls
             Div(
                 A(bookmark_icon, href='#', style='text-decoration:none'),
-                A('📚', href=f'/{language}/bookmarks', 
+                A('📚', href=_with_thread('/bookmarks', thread_id), 
+                  style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+                A('🧵', href=f'/threads/new?kanda={kanda}&sarga={sarga}&sloka={sloka_num}',
                   style='text-decoration:none; font-size:1.5em; margin-left:15px'),
                 A('🏠', href='/', 
                   style='text-decoration:none; font-size:1.5em; margin-left:15px'),
@@ -352,7 +652,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
             # JavaScript for keyboard navigation and bookmark toggle
             Script(f'''
                 // Mark as read
-                fetch('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read', {{method: 'POST'}});
+                fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read?thread={thread_id}', {{method: 'POST'}});
                 
                 // Keyboard navigation
                 document.addEventListener('keydown', (e) => {{
@@ -370,7 +670,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
                 document.getElementById('bookmark-btn').parentElement.addEventListener('click', async (e) => {{
                     e.preventDefault();
                     e.stopPropagation();
-                    const res = await fetch('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark', {{
+                    const res = await fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}', {{
                         method: 'POST'
                     }});
                     const data = await res.json();
@@ -384,64 +684,67 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
     )
 
 
-@rt('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark', methods=['POST'])
-def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, language: str):
+@rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark', methods=['POST'])
+def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Toggle bookmark status for a sloka."""
-    bookmarked = _toggle_bookmark(kanda, sarga, sloka_num)
+    thread_id = _resolve_thread_id(_parse_thread_id(request))
+    bookmarked = _toggle_bookmark(thread_id, kanda, sarga, sloka_num)
     
     return {'bookmarked': bookmarked}
 
 
-@rt('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read', methods=['POST'])
-def mark_read(kanda: int, sarga: int, sloka_num: int, language: str):
+@rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read', methods=['POST'])
+def mark_read(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Mark a sloka as last read position."""
-    _set_last_read(language, kanda, sarga, sloka_num)
+    thread_id = _resolve_thread_id(_parse_thread_id(request))
+    _update_progress(thread_id, kanda, sarga, sloka_num)
     return {'success': True}
 
 
-@rt('/{language}/bookmarks')
-def get_bookmarks(language: str):
+@rt('/bookmarks')
+def get_bookmarks(request: Request):
     """Display all bookmarked slokas."""
-    if language not in ['en', 'te', 'tg']:
-        return Response('Invalid language', status_code=404)
-    
+    thread_id = _parse_thread_id(request)
+    thread = _get_thread(thread_id) if thread_id is not None else None
+
     # Create bookmark links
     bookmark_links = []
-    for k, s, sl in _get_bookmarks():
-        if language == 'te':
-            link_text = f'కాండ {k} సర్గ {s} శ్లోక {sl}'
-        elif language == 'tg':
-            link_text = f'కాండ {k} సర్గ {s} శ్లోక {sl}'
-        else:  # en
-            link_text = f'Kanda {k} Sarga {s} Sloka {sl}'
-        
+    rows = _get_thread_bookmarks(thread_id)
+    if thread_id is not None and thread:
+        grouped = {thread['name']: rows}
+    else:
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row['thread_name'], []).append(row)
+
+    for thread_name, items in grouped.items():
         bookmark_links.append(
-            Div(
-                A(link_text,
-                  href=f'/{language}/kanda/{k}/sarga/{s}/sloka/{sl}',
-                  style='color:white; text-decoration:none; font-size:1.3em; padding:15px; display:block; border-bottom:1px solid #333; transition: background 0.2s',
-                  onmouseover='this.style.background="#1a1a1a"',
-                  onmouseout='this.style.background="transparent"')
-            )
+            H2(thread_name, style='color:#fbbf24; padding:10px 0; text-align:center')
         )
+        for row in items:
+            k = row['kanda']
+            s = row['sarga']
+            sl = row['sloka_num']
+            link_text = f'కాండ {k} సర్గ {s} శ్లోక {sl}'
+            bookmark_links.append(
+                Div(
+                    A(link_text,
+                      href=_with_thread(f'/kanda/{k}/sarga/{s}/sloka/{sl}', row['thread_id']),
+                      style='color:white; text-decoration:none; font-size:1.3em; padding:15px; display:block; border-bottom:1px solid #333; transition: background 0.2s',
+                      onmouseover='this.style.background="#1a1a1a"',
+                      onmouseout='this.style.background="transparent"')
+                )
+            )
     
     # No bookmarks message
     if not bookmark_links:
-        if language == 'te':
-            no_bookmarks = P('పేజీలు ఏవీ గుర్తించబడలేదు', style='text-align:center; color:#888; padding:40px; font-size:1.2em')
-        elif language == 'tg':
-            no_bookmarks = P('ఏ పేజీలూ గుర్తు పెట్టలేదు', style='text-align:center; color:#888; padding:40px; font-size:1.2em')
-        else:
-            no_bookmarks = P('No bookmarks yet', style='text-align:center; color:#888; padding:40px; font-size:1.2em')
+        no_bookmarks = P('పేజీలు ఏవీ గుర్తించబడలేదు', style='text-align:center; color:#888; padding:40px; font-size:1.2em')
         bookmark_links = [no_bookmarks]
     
     # Title text
-    if language == 'te':
-        title = 'పేజీలు గుర్తించబడ్డాయి'
-    elif language == 'tg':
-        title = 'గుర్తు పెట్టిన పేజీలు'
-    else:
-        title = 'Bookmarks'
+    title = 'పేజీలు గుర్తించబడ్డాయి'
+    if thread:
+        title = f'{title} - {thread["name"]}'
     
     return Html(
         Head(
