@@ -3,7 +3,7 @@
 import sys
 
 
-def serve(reload=False):
+def serve(reload=False, host="0.0.0.0", port=8000):
     """Start the web server."""
     try:
         import uvicorn
@@ -15,17 +15,18 @@ def serve(reload=False):
     from .app import app
     
     print("🕉️  Starting Valmiki Ramayana Reader...")
-    print("📖 Visit: http://localhost:8000")
+    print(f"📖 Visit: http://localhost:{port}")
     if reload:
         print("🔄 Auto-reload enabled")
+    print(f"🌐 Listening on: {host}:{port}")
     print("⌨️  Press Ctrl+C to stop")
     print()
     
     try:
         uvicorn.run(
             "valmiki.app:app" if reload else app,
-            host="0.0.0.0",
-            port=8000,
+            host=host,
+            port=port,
             reload=reload
         )
     except KeyboardInterrupt:
@@ -36,13 +37,42 @@ def main():
     """Main CLI entry point."""
     args = sys.argv[1:]
     
-    # Check for reload flag
+    # Parse flags
     reload = '--reload' in args or '-r' in args
-    if reload:
-        args = [a for a in args if a not in ['--reload', '-r']]
+    host = "0.0.0.0"
+    port = 8000
+    
+    # Extract --host
+    for i, arg in enumerate(args):
+        if arg == '--host' and i + 1 < len(args):
+            host = args[i + 1]
+            args = args[:i] + args[i+2:]
+            break
+    
+    # Extract --port
+    for i, arg in enumerate(args):
+        if arg == '--port' and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                print(f"Error: Invalid port number '{args[i + 1]}'")
+                sys.exit(1)
+            args = args[:i] + args[i+2:]
+            break
+        elif arg.startswith('--port='):
+            try:
+                port = int(arg.split('=')[1])
+            except ValueError:
+                print(f"Error: Invalid port number '{arg.split('=')[1]}'")
+                sys.exit(1)
+            args = [a for a in args if not a.startswith('--port=')]
+            break
+    
+    # Remove reload flags from args
+    args = [a for a in args if a not in ['--reload', '-r']]
     
     if not args or args[0] in ['serve', 'start', 'run']:
-        serve(reload=reload)
+        serve(reload=reload, host=host, port=port)
     elif args[0] in ['--help', '-h', 'help']:
         print("""
 Valmiki Ramayana Reader - CLI
@@ -54,13 +84,19 @@ Usage:
     valmiki run          Start the web server
     valmiki --reload     Start with auto-reload (dev mode)
     valmiki -r           Start with auto-reload (dev mode)
+    valmiki --port PORT  Specify port (default: 8000)
+    valmiki --host HOST  Specify host (default: 0.0.0.0)
     valmiki --help       Show this help message
 
 Examples:
-    valmiki              # Start server on http://localhost:8000
-    valmiki --reload     # Start with auto-reload for development
+    valmiki                      # Start server on http://localhost:8000
+    valmiki --reload             # Start with auto-reload for development
+    valmiki --port 3000          # Start on port 3000
+    valmiki --port=3000          # Alternative syntax
+    valmiki --host 127.0.0.1     # Listen only on localhost
+    valmiki --port 3000 --reload # Combine options
     
-Once started, visit http://localhost:8000 in your browser.
+Once started, visit http://localhost:PORT in your browser.
 """)
     elif args[0] in ['--version', '-v', 'version']:
         from . import __version__
