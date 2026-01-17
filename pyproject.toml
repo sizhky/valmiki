@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "valmiki"
+version = "0.1.0"
+description = "A web-based reader for the Valmiki Ramayana with scraping and multi-language support"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Yeshwanth", email = "your.email@example.com"}
+]
+keywords = ["ramayana", "valmiki", "sanskrit", "telugu", "scripture", "hindu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Religion",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
+
+dependencies = [
+    "httpx>=0.24.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "uvicorn>=0.40.0",
+    "python-fasthtml>=0.12.39",
+]
+
+[project.optional-dependencies]
+web = [
+    "python-fasthtml>=0.1.0",
+    "uvicorn>=0.24.0",
+]
+ai = [
+    "pydantic-ai>=0.0.1",
+]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+all = [
+    "valmiki[web,ai,dev]",
+]
+
+[project.scripts]
+valmiki = "valmiki.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/valmiki"
+Documentation = "https://github.com/yourusername/valmiki/blob/main/README.md"
+Repository = "https://github.com/yourusername/valmiki"
+Issues = "https://github.com/yourusername/valmiki/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
