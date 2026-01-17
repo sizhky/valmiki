@@ -634,6 +634,8 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         style='max-width:900px; margin:0 auto'
     )
     
+    progress_pct = int((sloka_num / max(len(sr), 1)) * 100)
+
     sloka_view = Div(
         Div(
             '',
@@ -653,6 +655,14 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 style='line-height:1.3'
             ),
             cls='rotation-hint'
+        ),
+
+        # Sarga progress bar
+        Div(
+            Div(
+                style=f'width:{progress_pct}%; height:100%; background:#fbbf24; transition: width 0.2s ease'
+            ),
+            style='position:fixed; top:0; left:0; right:0; height:6px; background:#1a1a1a; z-index:9999'
         ),
         
         # Top-right controls
