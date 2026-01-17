@@ -657,7 +657,15 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         
         # Top-right controls
         Div(
-            A(bookmark_icon, href='#', style='text-decoration:none'),
+            A(
+                bookmark_icon,
+                href='#',
+                id='bookmark-link',
+                style='text-decoration:none',
+                **{
+                    'data-bookmark-url': f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}'
+                }
+            ),
             A('📚', href=_with_thread('/bookmarks', thread_id), 
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
             A('🧵', href=f'/threads/new?kanda={kanda}&sarga={sarga}&sloka={sloka_num}',
@@ -723,7 +731,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             style='display:flex; min-height:100vh; background:black'
         ),
         
-        # JavaScript for keyboard navigation and bookmark toggle
+        # JavaScript for keyboard navigation
         Script(f'''
             // Keyboard navigation (reset handler on swap)
             if (window._slokaKeyHandler) {{
@@ -740,41 +748,6 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 }}
             }};
             document.addEventListener('keydown', window._slokaKeyHandler);
-            
-            // Bookmark toggle
-            document.getElementById('bookmark-btn').parentElement.addEventListener('click', async (e) => {{
-                e.preventDefault();
-                e.stopPropagation();
-                const res = await fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}', {{
-                    method: 'POST'
-                }});
-                const data = await res.json();
-                const svg = document.getElementById('bookmark-btn');
-                svg.style.fill = data.bookmarked ? '#fbbf24' : 'none';
-            }});
-
-            // Fullscreen toggle (user gesture required; may not work on all mobile browsers)
-            const fsBtn = document.getElementById('fullscreen-btn');
-            const fsHint = document.getElementById('fullscreen-hint');
-            const requestFs = () => {{
-                const el = document.documentElement;
-                const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
-                if (req) req.call(el);
-            }};
-
-            fsBtn.addEventListener('click', (e) => {{
-                e.preventDefault();
-                localStorage.setItem('fsPreferred', '1');
-                requestFs();
-            }});
-
-            if (localStorage.getItem('fsPreferred') === '1' && !document.fullscreenElement) {{
-                fsHint.style.display = 'flex';
-            }}
-
-            fsHint.addEventListener('click', () => {{
-                requestFs();
-            }});
         '''),
         
         id='sloka-view',
@@ -831,7 +804,57 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 }
             ''')
         ),
-        Body(sloka_view)
+        Body(
+            sloka_view,
+            Script('''
+                const requestFs = () => {
+                    const el = document.documentElement;
+                    const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+                    if (req) req.call(el);
+                };
+
+                const refreshFsHint = () => {
+                    const hint = document.getElementById('fullscreen-hint');
+                    if (!hint) return;
+                    if (localStorage.getItem('fsPreferred') === '1' && !document.fullscreenElement) {
+                        hint.style.display = 'flex';
+                    } else {
+                        hint.style.display = 'none';
+                    }
+                };
+
+                document.addEventListener('click', async (e) => {
+                    const bookmarkLink = e.target.closest('#bookmark-link');
+                    if (bookmarkLink) {
+                        e.preventDefault();
+                        const url = bookmarkLink.getAttribute('data-bookmark-url');
+                        const res = await fetch(url, { method: 'POST' });
+                        const data = await res.json();
+                        const svg = document.getElementById('bookmark-btn');
+                        if (svg) svg.style.fill = data.bookmarked ? '#fbbf24' : 'none';
+                        return;
+                    }
+
+                    const fsBtn = e.target.closest('#fullscreen-btn');
+                    if (fsBtn) {
+                        e.preventDefault();
+                        localStorage.setItem('fsPreferred', '1');
+                        requestFs();
+                        refreshFsHint();
+                        return;
+                    }
+
+                    const fsHint = e.target.closest('#fullscreen-hint');
+                    if (fsHint) {
+                        requestFs();
+                        refreshFsHint();
+                    }
+                });
+
+                document.addEventListener('htmx:afterSwap', refreshFsHint);
+                refreshFsHint();
+            ''')
+        )
     )
 
 
