@@ -1,11 +1,12 @@
 """FastHTML web application for Valmiki Ramayana Reader."""
 
 import sqlite3
+import dill
 from pathlib import Path
 
 from fasthtml.common import *
 from starlette.requests import Request
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, JSONResponse
 
 from .scraper import SargaReader
 
@@ -17,6 +18,7 @@ rt = app.route
 sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 DEFAULT_LANGUAGE = 'te'
+sarga_cache_dir = (Path(__file__).resolve().parents[2] / 'data' / 'sarga_cache')
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -31,6 +33,42 @@ def _get_conn():
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _sarga_cache_path(kanda: int, sarga: int) -> Path:
+    return sarga_cache_dir / f'kanda_{kanda}_sarga_{sarga}.dill'
+
+
+def _load_sarga_from_cache(kanda: int, sarga: int):
+    path = _sarga_cache_path(kanda, sarga)
+    if not path.exists():
+        return None
+    try:
+        with path.open('rb') as handle:
+            return dill.load(handle)
+    except Exception:
+        return None
+
+
+def _save_sarga_to_cache(kanda: int, sarga: int, sr: SargaReader) -> None:
+    sarga_cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _sarga_cache_path(kanda, sarga)
+    with path.open('wb') as handle:
+        dill.dump(sr, handle)
+
+
+def _get_sarga_reader(kanda: int, sarga: int) -> SargaReader:
+    sr = sarga_readers.get((kanda, sarga))
+    if sr is not None:
+        return sr
+    sr = _load_sarga_from_cache(kanda, sarga)
+    if sr is not None:
+        sarga_readers[(kanda, sarga)] = sr
+        return sr
+    sr = SargaReader(kanda, sarga, lang='te')
+    sarga_readers[(kanda, sarga)] = sr
+    _save_sarga_to_cache(kanda, sarga, sr)
+    return sr
 
 
 def _init_db():
@@ -386,6 +424,47 @@ def _thread_card_fragment(thread):
 _init_db()
 
 
+@rt('/manifest.webmanifest')
+def manifest():
+    """Web app manifest for PWA."""
+    payload = {
+        "name": "Valmiki Ramayana Reader",
+        "short_name": "Valmiki",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#000000",
+        "theme_color": "#000000",
+        "icons": [
+            {
+                "src": "/icon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml"
+            }
+        ]
+    }
+    return JSONResponse(payload, media_type='application/manifest+json')
+
+
+@rt('/icon.svg')
+def icon():
+    """Simple SVG icon for PWA."""
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+      <defs>
+        <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+          <stop offset="0%" stop-color="#fbbf24"/>
+          <stop offset="100%" stop-color="#f59e0b"/>
+        </linearGradient>
+      </defs>
+      <rect width="256" height="256" rx="48" fill="#0b0b0b"/>
+      <circle cx="128" cy="128" r="76" fill="url(#g)"/>
+      <path d="M128 70c-16 24-24 46-24 66 0 19 10 36 24 50 14-14 24-31 24-50 0-20-8-42-24-66z"
+            fill="#0b0b0b"/>
+    </svg>
+    """.strip()
+    return Response(svg, media_type='image/svg+xml')
+
+
 @rt('/threads/new')
 def new_thread(request: Request):
     """Create a new reading thread and redirect to its start."""
@@ -454,6 +533,12 @@ def home():
     return Html(
         Head(
             Title('Valmiki Ramayana Reader'),
+            Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
+            Meta(name='theme-color', content='#000000'),
+            Meta(name='apple-mobile-web-app-capable', content='yes'),
+            Meta(name='apple-mobile-web-app-status-bar-style', content='black-translucent'),
+            Meta(name='apple-mobile-web-app-title', content='Valmiki'),
+            Link(rel='manifest', href='/manifest.webmanifest'),
             Style('* { margin:0; padding:0; box-sizing:border-box; }'),
             Script(src='https://unpkg.com/htmx.org@1.9.12')
         ),
@@ -481,13 +566,10 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     thread_id = _resolve_thread_id(_parse_thread_id(request))
     
     # Get or create SargaReader for this sarga
-    sr = sarga_readers.get((kanda, sarga))
-    if sr is None:
-        try:
-            sr = SargaReader(kanda, sarga, lang='te')  # Always fetch Telugu script
-            sarga_readers[(kanda, sarga)] = sr
-        except Exception as e:
-            return Response(f'Error loading sarga: {str(e)}', status_code=500)
+    try:
+        sr = _get_sarga_reader(kanda, sarga)
+    except Exception as e:
+        return Response(f'Error loading sarga: {str(e)}', status_code=500)
     
     # Validate sloka number
     if sloka_num < 1 or sloka_num > len(sr):
@@ -505,13 +587,10 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     else:
         # Need to go to previous sarga
         if sarga > 1:
-            prev_sr = sarga_readers.get((kanda, sarga-1))
-            if prev_sr is None:
-                try:
-                    prev_sr = SargaReader(kanda, sarga-1, lang='te')
-                    sarga_readers[(kanda, sarga-1)] = prev_sr
-                except:
-                    prev_sr = None
+            try:
+                prev_sr = _get_sarga_reader(kanda, sarga-1)
+            except Exception:
+                prev_sr = None
             prev_url = f'/kanda/{kanda}/sarga/{sarga-1}/sloka/{len(prev_sr)}' if prev_sr else '#'
         else:
             prev_url = '#'
@@ -555,9 +634,166 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         style='max-width:900px; margin:0 auto'
     )
     
+    sloka_view = Div(
+        Div(
+            '',
+            id='mark-read',
+            **{
+                'hx-post': f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read?thread={thread_id}',
+                'hx-trigger': 'load',
+                'hx-swap': 'none',
+            }
+        ),
+        # Rotation hint overlay
+        Div(
+            Span('🔄', style='font-size:1.5em'),
+            Div(
+                Div('Rotate your device for better reading', style='font-weight:600'),
+                Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి', style='font-size:0.9em; margin-top:4px; opacity:0.95'),
+                style='line-height:1.3'
+            ),
+            cls='rotation-hint'
+        ),
+        
+        # Top-right controls
+        Div(
+            A(bookmark_icon, href='#', style='text-decoration:none'),
+            A('📚', href=_with_thread('/bookmarks', thread_id), 
+              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            A('🧵', href=f'/threads/new?kanda={kanda}&sarga={sarga}&sloka={sloka_num}',
+              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            A('⛶', href='#', id='fullscreen-btn',
+              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            A('🏠', href='/', 
+              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            style='position:fixed; top:20px; right:20px; z-index:1000; display:flex; gap:10px; align-items:center'
+        ),
+        
+        # Fullscreen hint (shown when user opted in)
+        Div(
+            'Tap to enter fullscreen',
+            id='fullscreen-hint',
+            style='display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#111; color:#fbbf24; padding:10px 14px; border:1px solid #333; border-radius:999px; z-index:1000; font-size:0.95em; cursor:pointer'
+        ),
+        
+        # Main content with navigation
+        Div(
+            # Left arrow
+            Div(
+                A('←', href=prev_url, id='prev',
+                  style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:#1a1a1a; color:white; width:100%; transition: background 0.2s',
+                  onmouseover='this.style.background="#2d2d2d"',
+                  onmouseout='this.style.background="#1a1a1a"',
+                  **{
+                      'hx-get': prev_url,
+                      'hx-target': '#sloka-view',
+                      'hx-swap': 'outerHTML',
+                      'hx-push-url': 'true',
+                  }),
+                style='flex:0 0 8%'
+            ),
+            
+            # Center content (clickable to go next)
+            Div(
+                sloka_content,
+                style='flex:1; padding:40px 20px; display:flex; align-items:center; justify-content:center; color:white; cursor:pointer',
+                **{
+                    'hx-get': next_url,
+                    'hx-target': '#sloka-view',
+                    'hx-swap': 'outerHTML',
+                    'hx-push-url': 'true',
+                }
+            ),
+            
+            # Right arrow
+            Div(
+                A('→', href=next_url, id='next',
+                  style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:#1a1a1a; color:white; width:100%; transition: background 0.2s',
+                  onmouseover='this.style.background="#2d2d2d"',
+                  onmouseout='this.style.background="#1a1a1a"',
+                  **{
+                      'hx-get': next_url,
+                      'hx-target': '#sloka-view',
+                      'hx-swap': 'outerHTML',
+                      'hx-push-url': 'true',
+                  }),
+                style='flex:0 0 8%'
+            ),
+            
+            style='display:flex; min-height:100vh; background:black'
+        ),
+        
+        # JavaScript for keyboard navigation and bookmark toggle
+        Script(f'''
+            // Keyboard navigation (reset handler on swap)
+            if (window._slokaKeyHandler) {{
+                document.removeEventListener('keydown', window._slokaKeyHandler);
+            }}
+            window._slokaKeyHandler = (e) => {{
+                if (e.key === 'ArrowLeft') {{
+                    e.preventDefault();
+                    document.getElementById('prev').click();
+                }}
+                if (e.key === 'ArrowRight') {{
+                    e.preventDefault();
+                    document.getElementById('next').click();
+                }}
+            }};
+            document.addEventListener('keydown', window._slokaKeyHandler);
+            
+            // Bookmark toggle
+            document.getElementById('bookmark-btn').parentElement.addEventListener('click', async (e) => {{
+                e.preventDefault();
+                e.stopPropagation();
+                const res = await fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}', {{
+                    method: 'POST'
+                }});
+                const data = await res.json();
+                const svg = document.getElementById('bookmark-btn');
+                svg.style.fill = data.bookmarked ? '#fbbf24' : 'none';
+            }});
+
+            // Fullscreen toggle (user gesture required; may not work on all mobile browsers)
+            const fsBtn = document.getElementById('fullscreen-btn');
+            const fsHint = document.getElementById('fullscreen-hint');
+            const requestFs = () => {{
+                const el = document.documentElement;
+                const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+                if (req) req.call(el);
+            }};
+
+            fsBtn.addEventListener('click', (e) => {{
+                e.preventDefault();
+                localStorage.setItem('fsPreferred', '1');
+                requestFs();
+            }});
+
+            if (localStorage.getItem('fsPreferred') === '1' && !document.fullscreenElement) {{
+                fsHint.style.display = 'flex';
+            }}
+
+            fsHint.addEventListener('click', () => {{
+                requestFs();
+            }});
+        '''),
+        
+        id='sloka-view',
+        style='background:black'
+    )
+
+    if request.headers.get('HX-Request') == 'true':
+        return sloka_view
+
     return Html(
         Head(
             Title(f'Sloka {sloka_data["sloka_num"]} - Valmiki Ramayana'),
+            Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
+            Meta(name='theme-color', content='#000000'),
+            Meta(name='apple-mobile-web-app-capable', content='yes'),
+            Meta(name='apple-mobile-web-app-status-bar-style', content='black-translucent'),
+            Meta(name='apple-mobile-web-app-title', content='Valmiki'),
+            Link(rel='manifest', href='/manifest.webmanifest'),
+            Script(src='https://unpkg.com/htmx.org@1.9.12'),
             Style('''
                 * { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, -apple-system, sans-serif; }
                 
@@ -595,92 +831,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 }
             ''')
         ),
-        Body(
-            # Rotation hint overlay
-            Div(
-                Span('🔄', style='font-size:1.5em'),
-                Div(
-                    Div('Rotate your device for better reading', style='font-weight:600'),
-                    Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి', style='font-size:0.9em; margin-top:4px; opacity:0.95'),
-                    style='line-height:1.3'
-                ),
-                cls='rotation-hint'
-            ),
-            
-            # Top-right controls
-            Div(
-                A(bookmark_icon, href='#', style='text-decoration:none'),
-                A('📚', href=_with_thread('/bookmarks', thread_id), 
-                  style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-                A('🧵', href=f'/threads/new?kanda={kanda}&sarga={sarga}&sloka={sloka_num}',
-                  style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-                A('🏠', href='/', 
-                  style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-                style='position:fixed; top:20px; right:20px; z-index:1000; display:flex; gap:10px; align-items:center'
-            ),
-            
-            # Main content with navigation
-            Div(
-                # Left arrow
-                Div(
-                    A('←', href=prev_url, id='prev',
-                      style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:#1a1a1a; color:white; width:100%; transition: background 0.2s',
-                      onmouseover='this.style.background="#2d2d2d"',
-                      onmouseout='this.style.background="#1a1a1a"'),
-                    style='flex:0 0 8%'
-                ),
-                
-                # Center content (clickable to go next)
-                Div(
-                    sloka_content,
-                    style='flex:1; padding:40px 20px; display:flex; align-items:center; justify-content:center; color:white; cursor:pointer',
-                    onclick=f"window.location.href='{next_url}'"
-                ),
-                
-                # Right arrow
-                Div(
-                    A('→', href=next_url, id='next',
-                      style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:#1a1a1a; color:white; width:100%; transition: background 0.2s',
-                      onmouseover='this.style.background="#2d2d2d"',
-                      onmouseout='this.style.background="#1a1a1a"'),
-                    style='flex:0 0 8%'
-                ),
-                
-                style='display:flex; min-height:100vh; background:black'
-            ),
-            
-            # JavaScript for keyboard navigation and bookmark toggle
-            Script(f'''
-                // Mark as read
-                fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read?thread={thread_id}', {{method: 'POST'}});
-                
-                // Keyboard navigation
-                document.addEventListener('keydown', (e) => {{
-                    if (e.key === 'ArrowLeft') {{
-                        e.preventDefault();
-                        document.getElementById('prev').click();
-                    }}
-                    if (e.key === 'ArrowRight') {{
-                        e.preventDefault();
-                        document.getElementById('next').click();
-                    }}
-                }});
-                
-                // Bookmark toggle
-                document.getElementById('bookmark-btn').parentElement.addEventListener('click', async (e) => {{
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const res = await fetch('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}', {{
-                        method: 'POST'
-                    }});
-                    const data = await res.json();
-                    const svg = document.getElementById('bookmark-btn');
-                    svg.style.fill = data.bookmarked ? '#fbbf24' : 'none';
-                }});
-            '''),
-            
-            style='background:black'
-        )
+        Body(sloka_view)
     )
 
 
@@ -749,6 +900,12 @@ def get_bookmarks(request: Request):
     return Html(
         Head(
             Title(f'{title} - Valmiki Ramayana'),
+            Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
+            Meta(name='theme-color', content='#000000'),
+            Meta(name='apple-mobile-web-app-capable', content='yes'),
+            Meta(name='apple-mobile-web-app-status-bar-style', content='black-translucent'),
+            Meta(name='apple-mobile-web-app-title', content='Valmiki'),
+            Link(rel='manifest', href='/manifest.webmanifest'),
             Style('* { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, -apple-system, sans-serif; }')
         ),
         Body(
