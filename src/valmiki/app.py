@@ -1,5 +1,8 @@
 """FastHTML web application for Valmiki Ramayana Reader."""
 
+import sqlite3
+from pathlib import Path
+
 from fasthtml.common import *
 
 from .scraper import SargaReader
@@ -10,8 +13,7 @@ rt = app.route
 
 # In-memory storage
 sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
-bookmarks = set()  # Set of bookmarked slokas: {(kanda, sarga, sloka_num)}
-last_read = {}  # Last read position per language: {language: (kanda, sarga, sloka_num)}
+db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -20,13 +22,108 @@ translation_cache = {
 }
 
 
+def _get_conn():
+    """Open a SQLite connection with a row factory."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    """Initialize SQLite schema if needed."""
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                kanda INTEGER NOT NULL,
+                sarga INTEGER NOT NULL,
+                sloka_num INTEGER NOT NULL,
+                PRIMARY KEY (kanda, sarga, sloka_num)
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS last_read (
+                language TEXT PRIMARY KEY,
+                kanda INTEGER NOT NULL,
+                sarga INTEGER NOT NULL,
+                sloka_num INTEGER NOT NULL
+            )
+            '''
+        )
+
+
+def _is_bookmarked(kanda: int, sarga: int, sloka_num: int) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT 1 FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
+            (kanda, sarga, sloka_num),
+        ).fetchone()
+    return row is not None
+
+
+def _toggle_bookmark(kanda: int, sarga: int, sloka_num: int) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT 1 FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
+            (kanda, sarga, sloka_num),
+        ).fetchone()
+        if row:
+            conn.execute(
+                'DELETE FROM bookmarks WHERE kanda = ? AND sarga = ? AND sloka_num = ?',
+                (kanda, sarga, sloka_num),
+            )
+            return False
+        conn.execute(
+            'INSERT INTO bookmarks (kanda, sarga, sloka_num) VALUES (?, ?, ?)',
+            (kanda, sarga, sloka_num),
+        )
+        return True
+
+
+def _get_bookmarks():
+    with _get_conn() as conn:
+        rows = conn.execute(
+            'SELECT kanda, sarga, sloka_num FROM bookmarks ORDER BY kanda, sarga, sloka_num'
+        ).fetchall()
+    return [(int(r['kanda']), int(r['sarga']), int(r['sloka_num'])) for r in rows]
+
+
+def _set_last_read(language: str, kanda: int, sarga: int, sloka_num: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            INSERT INTO last_read (language, kanda, sarga, sloka_num)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(language) DO UPDATE SET
+                kanda = excluded.kanda,
+                sarga = excluded.sarga,
+                sloka_num = excluded.sloka_num
+            ''',
+            (language, kanda, sarga, sloka_num),
+        )
+
+
+def _get_last_read():
+    with _get_conn() as conn:
+        rows = conn.execute(
+            'SELECT language, kanda, sarga, sloka_num FROM last_read'
+        ).fetchall()
+    return {r['language']: (int(r['kanda']), int(r['sarga']), int(r['sloka_num'])) for r in rows}
+
+
+_init_db()
+
+
 @rt('/')
 def home():
     """Home page with continue reading links."""
     links = []
     
     # Add continue reading links for each language with history
-    for lang, (k, s, sl) in last_read.items():
+    for lang, (k, s, sl) in _get_last_read().items():
         if lang == 'te':
             link_text = f'చదవడం కొనసాగించండి - కాండ {k} సర్గ {s} శ్లోక {sl}'
         elif lang == 'tg':
@@ -47,6 +144,14 @@ def home():
         A('Start Reading (English)', href='/en/kanda/1/sarga/1/sloka/1',
           style='display:block; padding:15px; margin:10px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.1em'),
     ]
+
+    # Bookmarks links
+    bookmarks_links = [
+        A('Visit Bookmarks (Telugu)', href='/te/bookmarks',
+          style='display:block; padding:15px; margin:10px 0; background:#1a1a1a; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
+        A('Visit Bookmarks (English)', href='/en/bookmarks',
+          style='display:block; padding:15px; margin:10px 0; background:#1a1a1a; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
+    ]
     
     return Html(
         Head(
@@ -61,6 +166,7 @@ def home():
                     *links if links else [P('No reading history yet', style='text-align:center; color:#888; padding:20px')],
                     Hr(style='border:none; border-top:1px solid #333; margin:30px 0'),
                     *start_links,
+                    *bookmarks_links,
                     style='max-width:600px; margin:0 auto; padding:20px'
                 ),
                 style='min-height:100vh; background:black'
@@ -132,7 +238,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
         bhaavam = bhaavam_en
     
     # Check if bookmarked
-    is_bookmarked = (kanda, sarga, sloka_num) in bookmarks
+    is_bookmarked = _is_bookmarked(kanda, sarga, sloka_num)
     bookmark_fill = '#fbbf24' if is_bookmarked else 'none'
     
     # Bookmark icon SVG
@@ -151,7 +257,6 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
         style='max-width:900px; margin:0 auto'
     )
     
-    warning_font_size = '3.5rem'
     return Html(
         Head(
             Title(f'Sloka {sloka_data["sloka_num"]} - Valmiki Ramayana'),
@@ -160,16 +265,16 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
                 
                 /* Rotation hint - hidden by default */
                 .rotation-hint {
-                    display: none;
+                    display: none !important;
                 }
                 
-                /* Show rotation hint on mobile/tablet portrait mode */
+                /* Show rotation hint ONLY on mobile/tablet portrait mode */
                 @media screen and (max-width: 1024px) and (orientation: portrait) {
                     .rotation-hint {
-                        display: flex;
+                        display: flex !important;
                         align-items: center;
                         justify-content: center;
-                        gap: 10px;
+                        gap: 12px;
                         position: fixed;
                         top: 0;
                         left: 0;
@@ -189,25 +294,19 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
                         from { transform: translateY(-100%); }
                         to { transform: translateY(0); }
                     }
-                    
-                    /* Adjust content padding to account for hint */
-                    body > div:last-child {
-                        padding-top: 50px;
-                    }
                 }
             ''')
         ),
         Body(
             # Rotation hint overlay
             Div(
-                Span('🔄', style=f'font-size:{warning_font_size}'),
+                Span('🔄', style='font-size:1.5em'),
                 Div(
-                    Div('Rotate your device for better reading experience', style=f'font-weight:600; font-size:{warning_font_size}'),
-                    Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి.', style=f'font-size:{warning_font_size}; margin-top:4px; opacity:0.95') if language in ['te', 'tg'] else None,
+                    Div('Rotate your device for better reading', style='font-weight:600'),
+                    Div('మెరుగైన పఠన అనుభవం కోసం మీ పరికరాన్ని అడ్డంగా తిప్పండి', style='font-size:0.9em; margin-top:4px; opacity:0.95') if language in ['te', 'tg'] else None,
                     style='line-height:1.3'
                 ),
-                cls='rotation-hint',
-                style='display:flex; align-items:center; gap:12px'
+                cls='rotation-hint'
             ),
             
             # Top-right controls
@@ -288,14 +387,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, language: str):
 @rt('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark', methods=['POST'])
 def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, language: str):
     """Toggle bookmark status for a sloka."""
-    bookmark_id = (kanda, sarga, sloka_num)
-    
-    if bookmark_id in bookmarks:
-        bookmarks.remove(bookmark_id)
-        bookmarked = False
-    else:
-        bookmarks.add(bookmark_id)
-        bookmarked = True
+    bookmarked = _toggle_bookmark(kanda, sarga, sloka_num)
     
     return {'bookmarked': bookmarked}
 
@@ -303,7 +395,7 @@ def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, language: str):
 @rt('/{language}/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read', methods=['POST'])
 def mark_read(kanda: int, sarga: int, sloka_num: int, language: str):
     """Mark a sloka as last read position."""
-    last_read[language] = (kanda, sarga, sloka_num)
+    _set_last_read(language, kanda, sarga, sloka_num)
     return {'success': True}
 
 
@@ -315,7 +407,7 @@ def get_bookmarks(language: str):
     
     # Create bookmark links
     bookmark_links = []
-    for k, s, sl in sorted(bookmarks):
+    for k, s, sl in _get_bookmarks():
         if language == 'te':
             link_text = f'కాండ {k} సర్గ {s} శ్లోక {sl}'
         elif language == 'tg':

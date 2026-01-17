@@ -3,7 +3,7 @@
 import sys
 
 
-def serve(reload=False, host="0.0.0.0", port=8000):
+def serve(reload=True, host="0.0.0.0", port=8000):
     """Start the web server."""
     try:
         import uvicorn
@@ -38,7 +38,7 @@ def main():
     args = sys.argv[1:]
     
     # Parse flags
-    reload = '--reload' in args or '-r' in args
+    reload = True
     host = "0.0.0.0"
     port = 8000
     
@@ -68,7 +68,7 @@ def main():
             args = [a for a in args if not a.startswith('--port=')]
             break
     
-    # Remove reload flags from args
+    # Remove reload flags from args (no-op but keeps CLI compatible)
     args = [a for a in args if a not in ['--reload', '-r']]
     
     if not args or args[0] in ['serve', 'start', 'run']:
@@ -82,19 +82,16 @@ Usage:
     valmiki serve        Start the web server
     valmiki start        Start the web server
     valmiki run          Start the web server
-    valmiki --reload     Start with auto-reload (dev mode)
-    valmiki -r           Start with auto-reload (dev mode)
     valmiki --port PORT  Specify port (default: 8000)
     valmiki --host HOST  Specify host (default: 0.0.0.0)
     valmiki --help       Show this help message
 
 Examples:
     valmiki                      # Start server on http://localhost:8000
-    valmiki --reload             # Start with auto-reload for development
     valmiki --port 3000          # Start on port 3000
     valmiki --port=3000          # Alternative syntax
     valmiki --host 127.0.0.1     # Listen only on localhost
-    valmiki --port 3000 --reload # Combine options
+    valmiki --port 3000          # Combine options
     
 Once started, visit http://localhost:PORT in your browser.
 """)
