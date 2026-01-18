@@ -19,6 +19,7 @@ sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaRea
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 DEFAULT_LANGUAGE = 'te'
 sarga_cache_dir = (Path(__file__).resolve().parents[2] / 'data' / 'sarga_cache')
+MAX_KANDA = 6
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -53,8 +54,152 @@ def _load_sarga_from_cache(kanda: int, sarga: int):
 def _save_sarga_to_cache(kanda: int, sarga: int, sr: SargaReader) -> None:
     sarga_cache_dir.mkdir(parents=True, exist_ok=True)
     path = _sarga_cache_path(kanda, sarga)
-    with path.open('wb') as handle:
-        dill.dump(sr, handle)
+    try:
+        with path.open('wb') as handle:
+            dill.dump(sr, handle)
+    except Exception:
+        # Cache write failures should not break page loads.
+        return
+
+
+def _record_sarga_len(kanda: int, sarga: int, sloka_count: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            INSERT INTO sarga_stats (kanda, sarga, sloka_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(kanda, sarga) DO UPDATE SET
+                sloka_count = excluded.sloka_count
+            ''',
+            (kanda, sarga, sloka_count),
+        )
+
+
+def _get_sarga_len(kanda: int, sarga: int) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT sloka_count FROM sarga_stats WHERE kanda = ? AND sarga = ?',
+            (kanda, sarga),
+        ).fetchone()
+    if row:
+        return int(row['sloka_count'])
+    sr = _get_sarga_reader(kanda, sarga)
+    count = len(sr)
+    _record_sarga_len(kanda, sarga, count)
+    return count
+
+
+def _get_kanda_total_slokas(kanda: int) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT total_slokas FROM kanda_stats WHERE kanda = ?',
+            (kanda,),
+        ).fetchone()
+        if row:
+            return int(row['total_slokas'])
+        row = conn.execute(
+            'SELECT COALESCE(SUM(sloka_count), 0) AS total FROM sarga_stats WHERE kanda = ?',
+            (kanda,),
+        ).fetchone()
+        if row and int(row['total']) > 0:
+            total_slokas = int(row['total'])
+            total_sargas = conn.execute(
+                'SELECT COUNT(*) AS count FROM sarga_stats WHERE kanda = ?',
+                (kanda,),
+            ).fetchone()
+            total_sargas = int(total_sargas['count']) if total_sargas else 0
+            conn.execute(
+                '''
+                INSERT INTO kanda_stats (kanda, total_sargas, total_slokas)
+                VALUES (?, ?, ?)
+                ON CONFLICT(kanda) DO UPDATE SET
+                    total_sargas = excluded.total_sargas,
+                    total_slokas = excluded.total_slokas
+                ''',
+                (kanda, total_sargas, total_slokas),
+            )
+            return total_slokas
+
+    total_slokas = 0
+    total_sargas = 0
+    for sarga in range(1, 301):
+        try:
+            count = _get_sarga_len(kanda, sarga)
+        except Exception:
+            break
+        if count <= 0:
+            break
+        total_slokas += count
+        total_sargas = sarga
+    if total_sargas == 0:
+        total_sargas = 1
+    if total_slokas == 0:
+        total_slokas = _get_sarga_len(kanda, 1)
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            INSERT INTO kanda_stats (kanda, total_sargas, total_slokas)
+            VALUES (?, ?, ?)
+            ON CONFLICT(kanda) DO UPDATE SET
+                total_sargas = excluded.total_sargas,
+                total_slokas = excluded.total_slokas
+            ''',
+            (kanda, total_sargas, total_slokas),
+        )
+    return total_slokas
+
+
+def _get_kanda_total_sargas(kanda: int) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT total_sargas FROM kanda_stats WHERE kanda = ?',
+            (kanda,),
+        ).fetchone()
+        if row and int(row['total_sargas']) > 0:
+            return int(row['total_sargas'])
+        row = conn.execute(
+            'SELECT COUNT(*) AS count FROM sarga_stats WHERE kanda = ?',
+            (kanda,),
+        ).fetchone()
+        if row and int(row['count']) > 0:
+            return int(row['count'])
+    return 0
+
+
+def _get_kanda_progress_slokas(kanda: int, sarga: int, sloka_num: int) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            '''
+            SELECT COALESCE(SUM(sloka_count), 0) AS total
+            FROM sarga_stats
+            WHERE kanda = ? AND sarga < ?
+            ''',
+            (kanda, sarga),
+        ).fetchone()
+    done = int(row['total']) if row else 0
+    return done + sloka_num
+
+
+def _get_ramayana_total_slokas() -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT COALESCE(SUM(sloka_count), 0) AS total FROM sarga_stats'
+        ).fetchone()
+    return int(row['total']) if row else 0
+
+
+def _get_ramayana_progress_slokas(kanda: int, sarga: int, sloka_num: int) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            '''
+            SELECT COALESCE(SUM(sloka_count), 0) AS total
+            FROM sarga_stats
+            WHERE kanda < ?
+            ''',
+            (kanda,),
+        ).fetchone()
+    done = int(row['total']) if row else 0
+    return done + _get_kanda_progress_slokas(kanda, sarga, sloka_num)
 
 
 def _get_sarga_reader(kanda: int, sarga: int) -> SargaReader:
@@ -64,10 +209,12 @@ def _get_sarga_reader(kanda: int, sarga: int) -> SargaReader:
     sr = _load_sarga_from_cache(kanda, sarga)
     if sr is not None:
         sarga_readers[(kanda, sarga)] = sr
+        _record_sarga_len(kanda, sarga, len(sr))
         return sr
     sr = SargaReader(kanda, sarga, lang='te')
     sarga_readers[(kanda, sarga)] = sr
     _save_sarga_to_cache(kanda, sarga, sr)
+    _record_sarga_len(kanda, sarga, len(sr))
     return sr
 
 
@@ -107,6 +254,25 @@ def _init_db():
                 sloka_num INTEGER NOT NULL,
                 PRIMARY KEY (thread_id, kanda, sarga, sloka_num),
                 FOREIGN KEY (thread_id) REFERENCES reading_threads(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS sarga_stats (
+                kanda INTEGER NOT NULL,
+                sarga INTEGER NOT NULL,
+                sloka_count INTEGER NOT NULL,
+                PRIMARY KEY (kanda, sarga)
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS kanda_stats (
+                kanda INTEGER PRIMARY KEY,
+                total_sargas INTEGER NOT NULL,
+                total_slokas INTEGER NOT NULL
             )
             '''
         )
@@ -599,8 +765,14 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     if sloka_num < len(sr):
         next_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num+1}'
     else:
-        # Go to next sarga (assume it exists)
-        next_url = f'/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
+        total_sargas = _get_kanda_total_sargas(kanda)
+        if total_sargas and sarga >= total_sargas and kanda >= MAX_KANDA:
+            next_url = '#'
+        elif total_sargas and sarga >= total_sargas:
+            next_url = f'/kanda/{kanda+1}/sarga/1/sloka/1'
+        else:
+            # Go to next sarga
+            next_url = f'/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
 
     if prev_url != '#':
         prev_url = _with_thread(prev_url, thread_id)
@@ -634,7 +806,13 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         style='max-width:900px; margin:0 auto'
     )
     
-    progress_pct = int((sloka_num / max(len(sr), 1)) * 100)
+    progress_pct = (sloka_num / max(len(sr), 1)) * 100
+    kanda_total = _get_kanda_total_slokas(kanda)
+    kanda_done = _get_kanda_progress_slokas(kanda, sarga, sloka_num)
+    kanda_pct = (kanda_done / max(kanda_total, 1)) * 100
+    ramayana_total = _get_ramayana_total_slokas()
+    ramayana_done = _get_ramayana_progress_slokas(kanda, sarga, sloka_num)
+    ramayana_pct = (ramayana_done / max(ramayana_total, 1)) * 100
 
     sloka_view = Div(
         Div(
@@ -660,9 +838,25 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         # Sarga progress bar
         Div(
             Div(
-                style=f'width:{progress_pct}%; height:100%; background:#fbbf24; transition: width 0.2s ease'
+                style=f'width:{progress_pct:.2f}%; height:100%; background:#fbbf24; transition: width 0.2s ease'
             ),
             style='position:fixed; top:0; left:0; right:0; height:6px; background:#1a1a1a; z-index:9999'
+        ),
+
+        # Kanda progress bar
+        Div(
+            Div(
+                style=f'width:{kanda_pct:.2f}%; height:100%; background:#f59e0b; transition: width 0.2s ease'
+            ),
+            style='position:fixed; top:6px; left:0; right:0; height:6px; background:#111; z-index:9998'
+        ),
+
+        # Ramayana progress bar
+        Div(
+            Div(
+                style=f'width:{ramayana_pct:.2f}%; height:100%; background:#d97706; transition: width 0.2s ease'
+            ),
+            style='position:fixed; top:12px; left:0; right:0; height:6px; background:#0d0d0d; z-index:9997'
         ),
         
         # Top-right controls
