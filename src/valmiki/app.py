@@ -767,7 +767,7 @@ def home():
             Link(rel='manifest', href='/manifest.webmanifest'),
             Style('''
                 * { margin:0; padding:0; box-sizing:border-box; }
-                body { font-family: system-ui, -apple-system, sans-serif; }
+                body { font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 600; }
             '''),
             Script(src='https://unpkg.com/htmx.org@1.9.12')
         ),
@@ -1030,7 +1030,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             Link(rel='icon', href='/static/favicon.png', type='image/png'),
             Link(rel='preconnect', href='https://fonts.googleapis.com'),
             Link(rel='preconnect', href='https://fonts.gstatic.com', crossorigin='true'),
-            Link(rel='stylesheet', href='https://fonts.googleapis.com/css2?family=Peddana&display=swap'),
+            Link(rel='stylesheet', href='https://fonts.googleapis.com/css2?family=Peddana&family=Noto+Sans:wght@600&display=swap'),
             Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
             Meta(name='theme-color', content='#000000'),
             Meta(name='apple-mobile-web-app-capable', content='yes'),
@@ -1039,7 +1039,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             Link(rel='manifest', href='/manifest.webmanifest'),
             Script(src='https://unpkg.com/htmx.org@1.9.12'),
             Style('''
-                * { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, -apple-system, sans-serif; }
+                * { margin:0; padding:0; box-sizing:border-box; font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 600; }
                 .telugu-text { font-family: "Peddana", "Noto Sans Telugu", serif; font-weight: 400; }
                 
                 /* Rotation hint - hidden by default */
@@ -1202,7 +1202,7 @@ def get_bookmarks(request: Request):
             Meta(name='apple-mobile-web-app-status-bar-style', content='black-translucent'),
             Meta(name='apple-mobile-web-app-title', content='Valmiki'),
             Link(rel='manifest', href='/manifest.webmanifest'),
-            Style('* { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, -apple-system, sans-serif; }')
+            Style('* { margin:0; padding:0; box-sizing:border-box; font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 600; }')
         ),
         Body(
             Div(
