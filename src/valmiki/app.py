@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import time
 import dill
 from pathlib import Path
 
@@ -48,9 +49,16 @@ translation_cache = {
 def _get_conn():
     """Open a SQLite connection with a row factory."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+    last_error = None
+    for _ in range(3):
+        try:
+            conn = sqlite3.connect(db_path, timeout=5)
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise last_error
 
 
 def _sarga_cache_path(kanda: int, sarga: int) -> Path:
@@ -526,11 +534,14 @@ def _parse_thread_id(request: Request) -> int | None:
 
 
 def _resolve_thread_id(thread_id: int | None) -> int:
-    if thread_id is not None:
-        thread = _get_thread(thread_id)
-        if thread:
-            return int(thread['id'])
-    return _ensure_default_thread()
+    try:
+        if thread_id is not None:
+            thread = _get_thread(thread_id)
+            if thread:
+                return int(thread['id'])
+        return _ensure_default_thread()
+    except sqlite3.OperationalError:
+        return thread_id or 1
 
 
 def _with_thread(url: str, thread_id: int) -> str:
