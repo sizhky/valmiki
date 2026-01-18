@@ -3,7 +3,7 @@
 import sqlite3
 import json
 import time
-import dill
+from urllib.parse import quote
 from pathlib import Path
 
 from fasthtml.common import *
@@ -20,8 +20,8 @@ rt = app.route
 sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 DEFAULT_LANGUAGE = 'te'
-sarga_cache_dir = (Path(__file__).resolve().parents[2] / 'data' / 'sarga_cache')
 MAX_KANDA = 6
+DEFAULT_USER_ID = 1
 stats_cache = {
     'ramayana_total': None,
     'kanda_totals': {},
@@ -46,6 +46,20 @@ translation_cache = {
 }
 
 
+class CachedSarga:
+    def __init__(self, slokas: list[dict]) -> None:
+        self._slokas = slokas
+
+    def __len__(self) -> int:
+        return len(self._slokas)
+
+    def __getitem__(self, index: int) -> dict:
+        return self._slokas[index]
+
+    def get_all_slokas(self) -> list[dict]:
+        return self._slokas
+
+
 def _get_conn():
     """Open a SQLite connection with a row factory."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +68,10 @@ def _get_conn():
         try:
             conn = sqlite3.connect(db_path, timeout=5)
             conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA foreign_keys = ON')
+            conn.execute('PRAGMA journal_mode = WAL')
+            conn.execute('PRAGMA synchronous = NORMAL')
+            conn.execute('PRAGMA busy_timeout = 3000')
             return conn
         except sqlite3.OperationalError as exc:
             last_error = exc
@@ -61,30 +79,59 @@ def _get_conn():
     raise last_error
 
 
-def _sarga_cache_path(kanda: int, sarga: int) -> Path:
-    return sarga_cache_dir / f'kanda_{kanda}_sarga_{sarga}.dill'
-
-
 def _load_sarga_from_cache(kanda: int, sarga: int):
-    path = _sarga_cache_path(kanda, sarga)
-    if not path.exists():
+    with _get_conn() as conn:
+        rows = conn.execute(
+            '''
+            SELECT sloka_index, sloka_num_text, sloka_text, bhaavam_en
+            FROM sarga_cache
+            WHERE kanda = ? AND sarga = ?
+            ORDER BY sloka_index
+            ''',
+            (kanda, sarga),
+        ).fetchall()
+    if not rows:
         return None
-    try:
-        with path.open('rb') as handle:
-            return dill.load(handle)
-    except Exception:
-        return None
+    slokas = []
+    for row in rows:
+        slokas.append(
+            {
+                'sloka_num': row['sloka_num_text'],
+                'sloka_text': row['sloka_text'],
+                'bhaavam_en': row['bhaavam_en'],
+                'pratipadaartham': {},
+            }
+        )
+    return CachedSarga(slokas)
 
 
 def _save_sarga_to_cache(kanda: int, sarga: int, sr: SargaReader) -> None:
-    sarga_cache_dir.mkdir(parents=True, exist_ok=True)
-    path = _sarga_cache_path(kanda, sarga)
-    try:
-        with path.open('wb') as handle:
-            dill.dump(sr, handle)
-    except Exception:
-        # Cache write failures should not break page loads.
-        return
+    slokas = sr.get_all_slokas()
+    rows = []
+    for idx, sloka in enumerate(slokas, start=1):
+        sloka_num_text = sloka.get('sloka_num') or f'{kanda}.{sarga}.{idx}'
+        rows.append(
+            (
+                kanda,
+                sarga,
+                idx,
+                sloka_num_text,
+                sloka.get('sloka_text', ''),
+                sloka.get('bhaavam_en', ''),
+            )
+        )
+    with _get_conn() as conn:
+        conn.execute(
+            'DELETE FROM sarga_cache WHERE kanda = ? AND sarga = ?',
+            (kanda, sarga),
+        )
+        conn.executemany(
+            '''
+            INSERT INTO sarga_cache (kanda, sarga, sloka_index, sloka_num_text, sloka_text, bhaavam_en)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            rows,
+        )
 
 
 def _record_sarga_len(kanda: int, sarga: int, sloka_count: int) -> None:
@@ -276,12 +323,35 @@ def _init_db():
         conn.execute('PRAGMA foreign_keys = ON')
         conn.execute(
             '''
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                birth_date TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(first_name, last_name, birth_date)
+            )
+            '''
+        )
+        conn.execute(
+            '''
             CREATE TABLE IF NOT EXISTS reading_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 language TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             '''
         )
@@ -328,25 +398,67 @@ def _init_db():
             )
             '''
         )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS sarga_cache (
+                kanda INTEGER NOT NULL,
+                sarga INTEGER NOT NULL,
+                sloka_index INTEGER NOT NULL,
+                sloka_num_text TEXT NOT NULL,
+                sloka_text TEXT NOT NULL,
+                bhaavam_en TEXT NOT NULL,
+                PRIMARY KEY (kanda, sarga, sloka_index)
+            )
+            '''
+        )
+        columns = conn.execute(
+            'PRAGMA table_info(reading_threads)'
+        ).fetchall()
+        column_names = {row['name'] for row in columns}
+        if 'user_id' not in column_names:
+            conn.execute(
+                'ALTER TABLE reading_threads ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1'
+            )
+        user = conn.execute(
+            'SELECT id FROM users WHERE id = ? LIMIT 1',
+            (DEFAULT_USER_ID,),
+        ).fetchone()
+        if not user:
+            conn.execute(
+                '''
+                INSERT OR IGNORE INTO users (id, first_name, last_name, birth_date)
+                VALUES (?, ?, ?, ?)
+                ''',
+                (DEFAULT_USER_ID, 'Default', 'User', '1900-01-01'),
+            )
+        conn.execute(
+            'UPDATE reading_threads SET user_id = ? WHERE user_id IS NULL',
+            (DEFAULT_USER_ID,),
+        )
 
 
-def _next_thread_name() -> str:
+def _next_thread_name(user_id: int) -> str:
     with _get_conn() as conn:
         row = conn.execute(
-            'SELECT COUNT(*) AS count FROM reading_threads',
+            'SELECT COUNT(*) AS count FROM reading_threads WHERE user_id = ?',
+            (user_id,),
         ).fetchone()
     count = int(row['count']) if row else 0
     return f'Thread {count + 1}'
 
 
 def _create_thread(name: str | None, kanda: int, sarga: int, sloka_num: int) -> int:
+    return _create_thread_for_user(DEFAULT_USER_ID, name, kanda, sarga, sloka_num)
+
+
+def _create_thread_for_user(user_id: int, name: str | None, kanda: int, sarga: int, sloka_num: int) -> int:
     thread_name = name.strip() if name else ''
     if not thread_name:
-        thread_name = _next_thread_name()
+        thread_name = _next_thread_name(user_id)
     with _get_conn() as conn:
         thread_id = conn.execute(
-            'INSERT INTO reading_threads (name, language) VALUES (?, ?)',
-            (thread_name, DEFAULT_LANGUAGE),
+            'INSERT INTO reading_threads (user_id, name, language) VALUES (?, ?, ?)',
+            (user_id, thread_name, DEFAULT_LANGUAGE),
         ).lastrowid
         conn.execute(
             '''
@@ -359,36 +471,46 @@ def _create_thread(name: str | None, kanda: int, sarga: int, sloka_num: int) -> 
 
 
 def _ensure_default_thread() -> int:
+    return _ensure_default_thread_for_user(DEFAULT_USER_ID)
+
+
+def _ensure_default_thread_for_user(user_id: int) -> int:
     with _get_conn() as conn:
         row = conn.execute(
-            'SELECT id FROM reading_threads ORDER BY id LIMIT 1',
+            'SELECT id FROM reading_threads WHERE user_id = ? ORDER BY id LIMIT 1',
+            (user_id,),
         ).fetchone()
     if row:
         return int(row['id'])
-    return _create_thread(None, 1, 1, 1)
+    return _create_thread_for_user(user_id, None, 1, 1, 1)
 
 
-def _get_thread(thread_id: int):
+def _get_thread(thread_id: int, user_id: int | None = None):
     with _get_conn() as conn:
+        clause = 'WHERE t.id = ?'
+        params = [thread_id]
+        if user_id is not None:
+            clause += ' AND t.user_id = ?'
+            params.append(user_id)
         return conn.execute(
-            '''
+            f'''
             SELECT t.id, t.name, t.language, p.kanda, p.sarga, p.sloka_num, p.updated_at
             FROM reading_threads t
             LEFT JOIN thread_progress p ON p.thread_id = t.id
-            WHERE t.id = ?
+            {clause}
             ''',
-            (thread_id,),
+            params,
         ).fetchone()
 
 
-def _rename_thread(thread_id: int, name: str) -> None:
+def _rename_thread(thread_id: int, user_id: int, name: str) -> None:
     clean_name = name.strip()
     if not clean_name:
         return
     with _get_conn() as conn:
         conn.execute(
-            'UPDATE reading_threads SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            (clean_name, thread_id),
+            'UPDATE reading_threads SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+            (clean_name, thread_id, user_id),
         )
 
 
@@ -412,15 +534,22 @@ def _update_progress(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> 
         )
 
 
-def _get_threads():
+def _get_threads(user_id: int | None = None):
+    params: list[object] = []
+    clause = ''
+    if user_id is not None:
+        clause = 'WHERE t.user_id = ?'
+        params.append(user_id)
     with _get_conn() as conn:
         rows = conn.execute(
-            '''
+            f'''
             SELECT t.id, t.name, t.language, p.kanda, p.sarga, p.sloka_num, p.updated_at
             FROM reading_threads t
             LEFT JOIN thread_progress p ON p.thread_id = t.id
+            {clause}
             ORDER BY p.updated_at DESC, t.id DESC
-            '''
+            ''',
+            params,
         ).fetchall()
     return rows
 
@@ -445,8 +574,8 @@ def _ensure_legacy_bookmarks() -> None:
         if current_count and int(current_count['count']) > 0:
             return
         thread_id = conn.execute(
-            'INSERT INTO reading_threads (name, language) VALUES (?, ?)',
-            ('Legacy Bookmarks', DEFAULT_LANGUAGE),
+            'INSERT INTO reading_threads (user_id, name, language) VALUES (?, ?, ?)',
+            (DEFAULT_USER_ID, 'Legacy Bookmarks', DEFAULT_LANGUAGE),
         ).lastrowid
         conn.execute(
             'INSERT INTO thread_progress (thread_id, kanda, sarga, sloka_num) VALUES (?, 1, 1, 1)',
@@ -501,13 +630,14 @@ def _toggle_bookmark(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> 
         return True
 
 
-def _get_thread_bookmarks(thread_id: int | None = None):
+def _get_thread_bookmarks(user_id: int, thread_id: int | None = None):
     _ensure_legacy_bookmarks()
     params: list[object] = []
-    clause = ''
+    clause = 'WHERE t.user_id = ?'
+    params.append(user_id)
     if thread_id is not None:
-        clause = 'WHERE t.id = ?'
         params.append(thread_id)
+        clause += ' AND t.id = ?'
     with _get_conn() as conn:
         rows = conn.execute(
             f'''
@@ -533,13 +663,80 @@ def _parse_thread_id(request: Request) -> int | None:
         return None
 
 
-def _resolve_thread_id(thread_id: int | None) -> int:
+def _get_user(user_id: int):
+    with _get_conn() as conn:
+        return conn.execute(
+            'SELECT id, first_name, last_name, birth_date FROM users WHERE id = ?',
+            (user_id,),
+        ).fetchone()
+
+
+def _get_or_create_user(first_name: str, last_name: str, birth_date: str) -> int:
+    clean_first = first_name.strip()
+    clean_last = last_name.strip()
+    clean_birth = birth_date.strip()
+    if not clean_first or not clean_last or not clean_birth:
+        return DEFAULT_USER_ID
+    with _get_conn() as conn:
+        row = conn.execute(
+            '''
+            SELECT id FROM users
+            WHERE first_name = ? AND last_name = ? AND birth_date = ?
+            ''',
+            (clean_first, clean_last, clean_birth),
+        ).fetchone()
+        if row:
+            return int(row['id'])
+        user_id = conn.execute(
+            '''
+            INSERT INTO users (first_name, last_name, birth_date)
+            VALUES (?, ?, ?)
+            ''',
+            (clean_first, clean_last, clean_birth),
+        ).lastrowid
+    return int(user_id)
+
+
+def _get_user_id(request: Request) -> int | None:
+    raw = request.cookies.get('valmiki_user')
+    if not raw:
+        return None
+    try:
+        user_id = int(raw)
+    except ValueError:
+        return None
+    if not _get_user(user_id):
+        return None
+    return user_id
+
+
+def _set_user_cookie(response: Response, user_id: int) -> None:
+    max_age = 60 * 60 * 24 * 365 * 10
+    response.set_cookie(
+        'valmiki_user',
+        str(user_id),
+        max_age=max_age,
+        httponly=True,
+        samesite='lax',
+        path='/',
+    )
+
+
+def _login_redirect(request: Request) -> Response:
+    next_path = request.url.path
+    if request.url.query:
+        next_path = f'{next_path}?{request.url.query}'
+    next_param = quote(next_path, safe='')
+    return RedirectResponse(f'/login?next={next_param}', status_code=303)
+
+
+def _resolve_thread_id(thread_id: int | None, user_id: int) -> int:
     try:
         if thread_id is not None:
-            thread = _get_thread(thread_id)
+            thread = _get_thread(thread_id, user_id)
             if thread:
                 return int(thread['id'])
-        return _ensure_default_thread()
+        return _ensure_default_thread_for_user(user_id)
     except sqlite3.OperationalError:
         return thread_id or 1
 
@@ -800,16 +997,119 @@ def assetlinks():
     return JSONResponse(payload)
 
 
+@rt('/login')
+def login(request: Request):
+    user_id = _get_user_id(request)
+    if user_id:
+        next_path = request.query_params.get('next')
+        if next_path and next_path.startswith('/'):
+            return RedirectResponse(next_path, status_code=303)
+        return RedirectResponse('/', status_code=303)
+    next_path = request.query_params.get('next', '/')
+    if not next_path.startswith('/'):
+        next_path = '/'
+    return Html(
+        Head(
+            Title('Valmiki - Login'),
+            Link(rel='icon', href='/static/favicon.png', type='image/png'),
+            Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
+            Style('''
+                * { margin:0; padding:0; box-sizing:border-box; }
+                body { font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 500; background:black; color:white; min-height:100vh; display:flex; align-items:flex-start; justify-content:center; padding:48px 24px 24px; }
+                .card { width:100%; max-width:520px; padding:32px; background:#0f0f0f; border:1px solid #222; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.45); }
+                label { display:block; font-size:0.95em; color:#bbb; margin-bottom:6px; }
+                input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid #333; background:#111; color:white; font-size:1em; }
+                .row { margin-bottom:16px; }
+                button { padding:12px 16px; border-radius:10px; border:none; background:#fbbf24; color:black; font-weight:600; cursor:pointer; width:100%; }
+                .hint { color:#888; font-size:0.9em; margin-top:6px; }
+            '''),
+        ),
+        Body(
+            Div(
+                H1('Sign In', style='color:#fbbf24; margin-bottom:8px; text-align:center'),
+                P('This keeps your reading threads separate on this device.', style='text-align:center; color:#888; margin-bottom:20px'),
+                Form(
+                    Div(
+                        Label('First Name'),
+                        Input(type='text', name='first_name', required=True, autocomplete='given-name'),
+                        class_='row',
+                    ),
+                    Div(
+                        Label('Last Name'),
+                        Input(type='text', name='last_name', required=True, autocomplete='family-name'),
+                        class_='row',
+                    ),
+                    Div(
+                        Label('Birth Date'),
+                        Input(type='date', name='birth_date', required=True, autocomplete='bday'),
+                        class_='row',
+                    ),
+                    Input(type='hidden', name='next', value=next_path),
+                    Button('Continue', type='submit'),
+                    class_='card',
+                    action='/login/submit',
+                    method='post',
+                ),
+            )
+        ),
+    )
+
+
+@rt('/login/submit', methods=['POST'])
+async def login_post(request: Request):
+    form = await request.form()
+    first_name = str(form.get('first_name', '')).strip()
+    last_name = str(form.get('last_name', '')).strip()
+    birth_date = str(form.get('birth_date', '')).strip()
+    next_path = str(form.get('next', '/')).strip()
+    if not next_path.startswith('/'):
+        next_path = '/'
+    user_id = _get_or_create_user(first_name, last_name, birth_date)
+    with _get_conn() as conn:
+        legacy_flag = conn.execute(
+            'SELECT value FROM app_meta WHERE key = ?',
+            ('legacy_threads_owner',),
+        ).fetchone()
+        if legacy_flag is None:
+            legacy_threads = conn.execute(
+                'SELECT COUNT(*) AS count FROM reading_threads WHERE user_id = ?',
+                (DEFAULT_USER_ID,),
+            ).fetchone()
+            legacy_count = int(legacy_threads['count']) if legacy_threads else 0
+            if legacy_count > 0 and user_id != DEFAULT_USER_ID:
+                conn.execute(
+                    'UPDATE reading_threads SET user_id = ? WHERE user_id = ?',
+                    (user_id, DEFAULT_USER_ID),
+                )
+                conn.execute(
+                    'INSERT INTO app_meta (key, value) VALUES (?, ?)',
+                    ('legacy_threads_owner', str(user_id)),
+                )
+    response = RedirectResponse(next_path, status_code=303)
+    _set_user_cookie(response, user_id)
+    return response
+
+
+@rt('/logout')
+def logout():
+    response = RedirectResponse('/login', status_code=303)
+    response.delete_cookie('valmiki_user', path='/')
+    return response
+
+
 @rt('/threads/new')
 def new_thread(request: Request):
     """Create a new reading thread and redirect to its start."""
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
     name = request.query_params.get('name', '')
     kanda = _parse_int(request.query_params.get('kanda'), 1)
     sarga = _parse_int(request.query_params.get('sarga'), 1)
     sloka_num = _parse_int(request.query_params.get('sloka'), 1)
-    thread_id = _create_thread(name, kanda, sarga, sloka_num)
+    thread_id = _create_thread_for_user(user_id, name, kanda, sarga, sloka_num)
     if request.headers.get('HX-Request') == 'true':
-        thread = _get_thread(thread_id)
+        thread = _get_thread(thread_id, user_id)
         return _thread_card_fragment(thread)
     return RedirectResponse(
         _with_thread(f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}', thread_id)
@@ -846,45 +1146,63 @@ def sarga_options(request: Request):
 @rt('/threads/{thread_id}/rename')
 async def rename_thread(thread_id: int, request: Request):
     """Rename an existing reading thread."""
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
     form = await request.form()
     name = str(form.get('name', '')).strip()
-    _rename_thread(thread_id, name)
-    thread = _get_thread(thread_id)
+    _rename_thread(thread_id, user_id, name)
+    thread = _get_thread(thread_id, user_id)
     if not thread:
         return Response('', status_code=404)
     return _thread_title_fragment(thread_id, thread['name'])
 
 
 @rt('/threads/{thread_id}/rename-form')
-def rename_thread_form(thread_id: int):
+def rename_thread_form(thread_id: int, request: Request):
     """Return inline rename form."""
-    thread = _get_thread(thread_id)
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread = _get_thread(thread_id, user_id)
     if not thread:
         return Response('', status_code=404)
     return _thread_rename_form_fragment(thread_id, thread['name'])
 
 
 @rt('/threads/{thread_id}/title')
-def thread_title(thread_id: int):
+def thread_title(thread_id: int, request: Request):
     """Return thread title fragment."""
-    thread = _get_thread(thread_id)
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread = _get_thread(thread_id, user_id)
     if not thread:
         return Response('', status_code=404)
     return _thread_title_fragment(thread_id, thread['name'])
 
 
 @rt('/threads/{thread_id}/delete', methods=['POST'])
-def delete_thread(thread_id: int):
+def delete_thread(thread_id: int, request: Request):
     """Delete a reading thread."""
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
     with _get_conn() as conn:
-        conn.execute('DELETE FROM reading_threads WHERE id = ?', (thread_id,))
+        conn.execute(
+            'DELETE FROM reading_threads WHERE id = ? AND user_id = ?',
+            (thread_id, user_id),
+        )
     return Response('')
 
 
 @rt('/')
-def home():
+def home(request: Request):
     """Home page with reading threads."""
-    threads = _get_threads()
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    threads = _get_threads(user_id)
     thread_cards = []
 
     for thread in threads:
@@ -912,6 +1230,11 @@ def home():
         ),
         Body(
             Div(
+                Div(
+                    A('⎋', href='/logout',
+                      style='text-decoration:none; color:#fbbf24; font-size:1.3em; padding:6px 10px; border:1px solid #333; border-radius:8px'),
+                    style='position:fixed; top:20px; right:20px; z-index:1000'
+                ),
                 H1('వాల్మీకి రామాయణం', style='text-align:center; color:#fbbf24; padding:30px; font-size:2.5em'),
                 H2('Valmiki Ramayana Reader', style='text-align:center; color:#888; padding:10px; font-size:1.5em'),
                 Div(
@@ -940,7 +1263,10 @@ def home():
 @rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}')
 async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Display a single sloka with navigation."""
-    thread_id = _resolve_thread_id(_parse_thread_id(request))
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     
     # Get or create SargaReader for this sarga
     try:
@@ -1110,6 +1436,8 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
             A('🏠', href='/', 
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            A('⎋', href='/logout',
+              style='text-decoration:none; font-size:1.4em; margin-left:10px'),
             style='position:fixed; top:20px; right:20px; z-index:1000; display:flex; gap:10px; align-items:center'
         ),
         
@@ -1302,7 +1630,10 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
 @rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark', methods=['POST'])
 def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Toggle bookmark status for a sloka."""
-    thread_id = _resolve_thread_id(_parse_thread_id(request))
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     bookmarked = _toggle_bookmark(thread_id, kanda, sarga, sloka_num)
     
     return {'bookmarked': bookmarked}
@@ -1311,7 +1642,10 @@ def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, request: Request):
 @rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/mark-read', methods=['POST'])
 def mark_read(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Mark a sloka as last read position."""
-    thread_id = _resolve_thread_id(_parse_thread_id(request))
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     _update_progress(thread_id, kanda, sarga, sloka_num)
     return {'success': True}
 
@@ -1320,11 +1654,14 @@ def mark_read(kanda: int, sarga: int, sloka_num: int, request: Request):
 def get_bookmarks(request: Request):
     """Display all bookmarked slokas."""
     thread_id = _parse_thread_id(request)
-    thread = _get_thread(thread_id) if thread_id is not None else None
+    user_id = _get_user_id(request)
+    if not user_id:
+        return _login_redirect(request)
+    thread = _get_thread(thread_id, user_id) if thread_id is not None else None
 
     # Create bookmark links
     bookmark_links = []
-    rows = _get_thread_bookmarks(thread_id)
+    rows = _get_thread_bookmarks(user_id, thread_id)
     if thread_id is not None and thread:
         grouped = {thread['name']: rows}
     else:
