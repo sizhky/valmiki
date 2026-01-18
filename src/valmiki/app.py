@@ -1202,6 +1202,8 @@ def home(request: Request):
     user_id = _get_user_id(request)
     if not user_id:
         return _login_redirect(request)
+    user = _get_user(user_id)
+    first_name = user['first_name'] if user else 'Your'
     threads = _get_threads(user_id)
     thread_cards = []
 
@@ -1238,7 +1240,7 @@ def home(request: Request):
                 H1('వాల్మీకి రామాయణం', style='text-align:center; color:#fbbf24; padding:30px; font-size:2.5em'),
                 H2('Valmiki Ramayana Reader', style='text-align:center; color:#888; padding:10px; font-size:1.5em'),
                 Div(
-                    H3('Your Reading Threads', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
+                    H3(f"{first_name}'s Reading Threads", style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
                     Div(*thread_cards, id='threads-list') if thread_cards else Div(P('No threads yet', style='text-align:center; color:#888; padding:20px'), id='threads-list'),
                     Hr(style='border:none; border-top:1px solid #333; margin:30px 0'),
                     H3('Start a New Thread', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
@@ -1436,8 +1438,6 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
             A('🏠', href='/', 
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-            A('⎋', href='/logout',
-              style='text-decoration:none; font-size:1.4em; margin-left:10px'),
             style='position:fixed; top:20px; right:20px; z-index:1000; display:flex; gap:10px; align-items:center'
         ),
         
