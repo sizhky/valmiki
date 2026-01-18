@@ -2,6 +2,7 @@
 """Populate sarga and kanda sloka counts in the SQLite DB."""
 
 import argparse
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -66,6 +67,15 @@ def _fetch_sarga_count(kanda: int, sarga: int) -> tuple[int, int]:
         sloka_num = first.get('sloka_num') or ''
     except Exception:
         sloka_num = ''
+    if not sloka_num:
+        try:
+            body = reader.rows[0].select_one('.views-field-body .field-content')
+            text = body.get_text(' ', strip=True) if body else ''
+            match = re.search(r'(\d+)\.(\d+)\.(\d+)', text)
+            if match:
+                sloka_num = '.'.join(match.groups())
+        except Exception:
+            pass
     prefix = f'{kanda}.{sarga}.'
     if not sloka_num.startswith(prefix):
         raise ValueError(f'unexpected sloka prefix for kanda {kanda} sarga {sarga}: {sloka_num}')
@@ -80,14 +90,46 @@ def _get_cached_sargas(conn: sqlite3.Connection, kanda: int) -> dict[int, int]:
     return {int(r[0]): int(r[1]) for r in rows}
 
 
+def _get_cached_kanda_total(conn: sqlite3.Connection, kanda: int) -> int:
+    row = conn.execute(
+        'SELECT total_sargas FROM kanda_stats WHERE kanda = ?',
+        (kanda,),
+    ).fetchone()
+    if row and row[0]:
+        return int(row[0])
+    return 0
+
+
+def _is_complete(results: dict[int, int], total_sargas: int) -> bool:
+    if total_sargas <= 1:
+        return False
+    max_cached = max(results.keys()) if results else 0
+    if total_sargas < max_cached:
+        return False
+    if len(results) != total_sargas:
+        return False
+    for sarga in range(1, total_sargas + 1):
+        if sarga not in results:
+            return False
+    return True
+
+
 def count_kanda(conn: sqlite3.Connection, kanda: int, max_sarga: int, workers: int) -> None:
     results: dict[int, int] = _get_cached_sargas(conn, kanda)
     if results:
         print(f'kanda {kanda}: using {len(results)} cached sargas')
+    cached_total = _get_cached_kanda_total(conn, kanda)
+    if _is_complete(results, cached_total):
+        total_slokas = sum(results.values())
+        upsert_kanda(conn, kanda, cached_total, total_slokas)
+        print(f'kanda {kanda} total: sargas={cached_total} slokas={total_slokas}')
+        return
+    failures: list[str] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
+        upper = cached_total if cached_total > 1 else max_sarga
         futures = {
             executor.submit(_fetch_sarga_count, kanda, s): s
-            for s in range(1, max_sarga + 1)
+            for s in range(1, upper + 1)
             if s not in results
         }
         for future in as_completed(futures):
@@ -95,23 +137,23 @@ def count_kanda(conn: sqlite3.Connection, kanda: int, max_sarga: int, workers: i
             try:
                 sarga, count = future.result()
             except Exception:
+                if len(failures) < 5:
+                    failures.append(f'sarga {sarga}: {future.exception()}')
                 continue
             if count > 0:
                 results[sarga] = count
                 upsert_sarga(conn, kanda, sarga, count)
                 print(f'kanda {kanda} sarga {sarga}: {count}')
 
-    total_slokas = 0
-    total_sargas = 0
-    for sarga in range(1, max_sarga + 1):
-        count = results.get(sarga)
-        if not count:
-            break
-        total_sargas = sarga
-        total_slokas += count
+    total_slokas = sum(results.values())
+    total_sargas = max(results.keys()) if results else 0
     if total_sargas > 0:
         upsert_kanda(conn, kanda, total_sargas, total_slokas)
         print(f'kanda {kanda} total: sargas={total_sargas} slokas={total_slokas}')
+    if failures:
+        print(f'kanda {kanda} warnings:')
+        for line in failures:
+            print(f'  - {line}')
 
 
 def main() -> None:

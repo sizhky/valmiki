@@ -173,20 +173,18 @@ def _get_kanda_total_sargas(kanda: int) -> int:
     if cached is not None:
         return cached
     with _get_conn() as conn:
-        row = conn.execute(
+        total_row = conn.execute(
             'SELECT total_sargas FROM kanda_stats WHERE kanda = ?',
             (kanda,),
         ).fetchone()
-        if row and int(row['total_sargas']) > 0:
-            total = int(row['total_sargas'])
-            stats_cache['kanda_sargas'][kanda] = total
-            return total
+        total_from_stats = int(total_row['total_sargas']) if total_row and total_row['total_sargas'] is not None else 0
         row = conn.execute(
-            'SELECT COUNT(*) AS count FROM sarga_stats WHERE kanda = ?',
+            'SELECT MAX(sarga) AS max_sarga FROM sarga_stats WHERE kanda = ?',
             (kanda,),
         ).fetchone()
-        if row and int(row['count']) > 0:
-            total = int(row['count'])
+        max_sarga = int(row['max_sarga']) if row and row['max_sarga'] is not None else 0
+        total = max(total_from_stats, max_sarga)
+        if total > 0:
             stats_cache['kanda_sargas'][kanda] = total
             return total
     return 0
@@ -356,7 +354,12 @@ def _ensure_default_thread() -> int:
 def _get_thread(thread_id: int):
     with _get_conn() as conn:
         return conn.execute(
-            'SELECT id, name, language FROM reading_threads WHERE id = ?',
+            '''
+            SELECT t.id, t.name, t.language, p.kanda, p.sarga, p.sloka_num, p.updated_at
+            FROM reading_threads t
+            LEFT JOIN thread_progress p ON p.thread_id = t.id
+            WHERE t.id = ?
+            ''',
             (thread_id,),
         ).fetchone()
 
@@ -584,6 +587,77 @@ def _thread_rename_form_fragment(thread_id: int, title: str):
     )
 
 
+def _new_thread_prompt_fragment():
+    initial_sargas = _get_kanda_total_sargas(1)
+    if initial_sargas <= 0:
+        initial_sargas = 100
+    return Form(
+        Input(
+            type='text',
+            name='name',
+            placeholder='New reading thread name',
+            autofocus='true',
+            style='padding:8px 10px; width:100%; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white',
+        ),
+        Div(
+            Select(
+                *[Option(str(k), value=str(k)) for k in range(1, MAX_KANDA + 1)],
+                name='kanda',
+                **{
+                    'hx-get': '/threads/sarga-options',
+                    'hx-target': '#new-thread-sarga',
+                    'hx-swap': 'outerHTML',
+                    'hx-trigger': 'change',
+                },
+                style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; flex:1'
+            ),
+            Select(
+                *[Option(str(s), value=str(s)) for s in range(1, initial_sargas + 1)],
+                name='sarga',
+                id='new-thread-sarga',
+                style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; flex:1'
+            ),
+            style='display:flex; gap:8px; margin-top:10px'
+        ),
+        Div(
+            Button('Create', type='submit',
+                   style='padding:8px 12px; border:none; border-radius:8px; background:#fbbf24; color:black; cursor:pointer'),
+            Button(
+                'Cancel',
+                type='button',
+                style='padding:8px 12px; border:none; border-radius:8px; background:#2d2d2d; color:#fbbf24; cursor:pointer',
+                **{
+                    'hx-get': '/threads/new-button',
+                    'hx-target': '#new-thread-cta',
+                    'hx-swap': 'outerHTML',
+                },
+            ),
+            style='display:flex; gap:8px; margin-top:10px',
+        ),
+        id='new-thread-cta',
+        action='/threads/new',
+        method='get',
+        **{
+            'hx-get': '/threads/new',
+            'hx-target': '#threads-list',
+            'hx-swap': 'afterbegin',
+        },
+    )
+
+
+def _new_thread_button_fragment():
+    return A(
+        'New Reading Thread',
+        href='#',
+        id='new-thread-cta',
+        style='display:block; padding:12px 14px; margin:8px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em',
+        **{
+            'hx-get': '/threads/new-form',
+            'hx-target': '#new-thread-cta',
+            'hx-swap': 'outerHTML',
+        },
+    )
+
 def _thread_card_fragment(thread):
     k = thread['kanda']
     s = thread['sarga']
@@ -698,8 +772,38 @@ def new_thread(request: Request):
     sarga = _parse_int(request.query_params.get('sarga'), 1)
     sloka_num = _parse_int(request.query_params.get('sloka'), 1)
     thread_id = _create_thread(name, kanda, sarga, sloka_num)
+    if request.headers.get('HX-Request') == 'true':
+        thread = _get_thread(thread_id)
+        return _thread_card_fragment(thread)
     return RedirectResponse(
         _with_thread(f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}', thread_id)
+    )
+
+
+@rt('/threads/new-form')
+def new_thread_form():
+    """Inline create form for new thread."""
+    return _new_thread_prompt_fragment()
+
+
+@rt('/threads/new-button')
+def new_thread_button():
+    """Inline button for new thread."""
+    return _new_thread_button_fragment()
+
+
+@rt('/threads/sarga-options')
+def sarga_options(request: Request):
+    """Return sarga options for a selected kanda."""
+    kanda = _parse_int(request.query_params.get('kanda'), 1)
+    total_sargas = _get_kanda_total_sargas(kanda)
+    if total_sargas <= 0:
+        total_sargas = 100
+    return Select(
+        *[Option(str(s), value=str(s)) for s in range(1, total_sargas + 1)],
+        name='sarga',
+        id='new-thread-sarga',
+        style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; flex:1'
     )
 
 
@@ -751,8 +855,7 @@ def home():
         thread_cards.append(_thread_card_fragment(thread))
 
     new_thread_links = [
-        A('New Reading Thread', href='/threads/new',
-          style='display:block; padding:12px 14px; margin:8px 0; background:#2d2d2d; color:#fbbf24; text-decoration:none; border-radius:8px; font-size:1.05em'),
+        _new_thread_button_fragment(),
     ]
 
     return Html(
@@ -767,7 +870,7 @@ def home():
             Link(rel='manifest', href='/manifest.webmanifest'),
             Style('''
                 * { margin:0; padding:0; box-sizing:border-box; }
-                body { font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 900; }
+                body { font-family: "Noto Sans", system-ui, -apple-system, sans-serif; font-weight: 500; }
             '''),
             Script(src='https://unpkg.com/htmx.org@1.9.12')
         ),
@@ -777,7 +880,7 @@ def home():
                 H2('Valmiki Ramayana Reader', style='text-align:center; color:#888; padding:10px; font-size:1.5em'),
                 Div(
                     H3('Your Reading Threads', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
-                    *thread_cards if thread_cards else [P('No threads yet', style='text-align:center; color:#888; padding:20px')],
+                    Div(*thread_cards, id='threads-list') if thread_cards else Div(P('No threads yet', style='text-align:center; color:#888; padding:20px'), id='threads-list'),
                     Hr(style='border:none; border-top:1px solid #333; margin:30px 0'),
                     H3('Start a New Thread', style='color:#fbbf24; margin:10px 0 20px; text-align:center'),
                     *new_thread_links,
@@ -814,13 +917,24 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     if sloka_num > 1:
         prev_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num-1}'
     else:
-        # Need to go to previous sarga
+        # Need to go to previous sarga or previous kanda
         if sarga > 1:
             try:
                 prev_sr = _get_sarga_reader(kanda, sarga-1)
             except Exception:
                 prev_sr = None
             prev_url = f'/kanda/{kanda}/sarga/{sarga-1}/sloka/{len(prev_sr)}' if prev_sr else '#'
+        elif kanda > 1:
+            prev_kanda = kanda - 1
+            prev_sarga = _get_kanda_total_sargas(prev_kanda)
+            if prev_sarga <= 0:
+                prev_url = '#'
+            else:
+                try:
+                    prev_sr = _get_sarga_reader(prev_kanda, prev_sarga)
+                except Exception:
+                    prev_sr = None
+                prev_url = f'/kanda/{prev_kanda}/sarga/{prev_sarga}/sloka/{len(prev_sr)}' if prev_sr else '#'
         else:
             prev_url = '#'
     
