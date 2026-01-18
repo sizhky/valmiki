@@ -1019,7 +1019,7 @@ def login(request: Request):
                 .card { width:100%; max-width:520px; padding:32px; background:#0f0f0f; border:1px solid #222; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.45); }
                 label { display:block; font-size:0.95em; color:#bbb; margin-bottom:6px; }
                 input { width:100%; padding:12px 14px; border-radius:10px; border:1px solid #333; background:#111; color:white; font-size:1em; }
-                .row { margin-bottom:16px; }
+                .row { margin-bottom:20px; }
                 button { padding:12px 16px; border-radius:10px; border:none; background:#fbbf24; color:black; font-weight:600; cursor:pointer; width:100%; }
                 .hint { color:#888; font-size:0.9em; margin-top:6px; }
             '''),
@@ -1027,22 +1027,22 @@ def login(request: Request):
         Body(
             Div(
                 H1('Sign In', style='color:#fbbf24; margin-bottom:8px; text-align:center'),
-                P('This keeps your reading threads separate on this device.', style='text-align:center; color:#888; margin-bottom:20px'),
+                P('This helps to keep your reading organized', style='text-align:center; color:#888; margin-bottom:20px'),
                 Form(
                     Div(
                         Label('First Name'),
                         Input(type='text', name='first_name', required=True, autocomplete='given-name'),
-                        class_='row',
+                        style='margin-bottom:20px',
                     ),
                     Div(
                         Label('Last Name'),
                         Input(type='text', name='last_name', required=True, autocomplete='family-name'),
-                        class_='row',
+                        style='margin-bottom:20px',
                     ),
                     Div(
-                        Label('Birth Date'),
+                        Label('Date of Birth'),
                         Input(type='date', name='birth_date', required=True, autocomplete='bday'),
-                        class_='row',
+                        style='margin-bottom:20px',
                     ),
                     Input(type='hidden', name='next', value=next_path),
                     Button('Continue', type='submit'),
