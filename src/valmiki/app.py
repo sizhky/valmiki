@@ -600,24 +600,32 @@ def _new_thread_prompt_fragment():
             style='padding:8px 10px; width:100%; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white',
         ),
         Div(
-            Select(
-                *[Option(str(k), value=str(k)) for k in range(1, MAX_KANDA + 1)],
-                name='kanda',
-                **{
-                    'hx-get': '/threads/sarga-options',
-                    'hx-target': '#new-thread-sarga',
-                    'hx-swap': 'outerHTML',
-                    'hx-trigger': 'change',
-                },
-                style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; flex:1'
+            Div(
+                P('Kanda', style='color:#888; font-size:0.9em; margin-bottom:6px'),
+                Select(
+                    *[Option(str(k), value=str(k)) for k in range(1, MAX_KANDA + 1)],
+                    name='kanda',
+                    **{
+                        'hx-get': '/threads/sarga-options',
+                        'hx-target': '#new-thread-sarga',
+                        'hx-swap': 'outerHTML',
+                        'hx-trigger': 'change',
+                    },
+                    style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; width:100%'
+                ),
+                style='flex:1'
             ),
-            Select(
-                *[Option(str(s), value=str(s)) for s in range(1, initial_sargas + 1)],
-                name='sarga',
-                id='new-thread-sarga',
-                style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; flex:1'
+            Div(
+                P('Sarga', style='color:#888; font-size:0.9em; margin-bottom:6px'),
+                Select(
+                    *[Option(str(s), value=str(s)) for s in range(1, initial_sargas + 1)],
+                    name='sarga',
+                    id='new-thread-sarga',
+                    style='padding:8px 10px; border-radius:8px; border:1px solid #333; background:#0f0f0f; color:white; width:100%'
+                ),
+                style='flex:1'
             ),
-            style='display:flex; gap:8px; margin-top:10px'
+            style='display:flex; gap:12px; margin-top:10px'
         ),
         Div(
             Button('Create', type='submit',
