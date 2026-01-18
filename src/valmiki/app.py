@@ -671,12 +671,12 @@ def _get_user(user_id: int):
         ).fetchone()
 
 
-def _get_or_create_user(first_name: str, last_name: str, birth_date: str) -> int:
+def _get_or_create_user(first_name: str, last_name: str, birth_date: str) -> tuple[int, bool]:
     clean_first = first_name.strip()
     clean_last = last_name.strip()
     clean_birth = birth_date.strip()
     if not clean_first or not clean_last or not clean_birth:
-        return DEFAULT_USER_ID
+        return DEFAULT_USER_ID, False
     with _get_conn() as conn:
         row = conn.execute(
             '''
@@ -686,7 +686,7 @@ def _get_or_create_user(first_name: str, last_name: str, birth_date: str) -> int
             (clean_first, clean_last, clean_birth),
         ).fetchone()
         if row:
-            return int(row['id'])
+            return int(row['id']), False
         user_id = conn.execute(
             '''
             INSERT INTO users (first_name, last_name, birth_date)
@@ -694,7 +694,7 @@ def _get_or_create_user(first_name: str, last_name: str, birth_date: str) -> int
             ''',
             (clean_first, clean_last, clean_birth),
         ).lastrowid
-    return int(user_id)
+    return int(user_id), True
 
 
 def _get_user_id(request: Request) -> int | None:
@@ -1064,7 +1064,11 @@ async def login_post(request: Request):
     next_path = str(form.get('next', '/')).strip()
     if not next_path.startswith('/'):
         next_path = '/'
-    user_id = _get_or_create_user(first_name, last_name, birth_date)
+    user_id, created = _get_or_create_user(first_name, last_name, birth_date)
+    if created:
+        _create_thread_for_user(user_id, 'Sankshipta Ramayanam', 1, 1, 1)
+        _create_thread_for_user(user_id, 'Pattabhisheka Sarga', 6, 131, 1)
+        _create_thread_for_user(user_id, 'Sundara Kanda', 5, 1, 1)
     with _get_conn() as conn:
         legacy_flag = conn.execute(
             'SELECT value FROM app_meta WHERE key = ?',
@@ -1552,14 +1556,14 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                         justify-content: center;
                         gap: 12px;
                         position: fixed;
-                        top: 0;
+                        top: 56px;
                         left: 0;
                         right: 0;
                         background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
                         color: black;
                         padding: 12px 20px;
                         text-align: center;
-                        z-index: 10000;
+                        z-index: 900;
                         font-weight: 600;
                         font-size: 1.3em;
                         box-shadow: 0 2px 10px rgba(251, 191, 36, 0.3);
