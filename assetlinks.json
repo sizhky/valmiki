@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "dev.yeshwanth.valmiki.twa",
+        "sha256_cert_fingerprints": ["67:15:88:4B:FC:3C:A2:7D:7F:DE:AF:BE:6D:80:47:E7:F0:BE:09:01:62:15:90:B6:B1:29:72:12:BE:F5:19:CB"]
+      }
+    }]

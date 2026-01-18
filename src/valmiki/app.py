@@ -1,6 +1,7 @@
 """FastHTML web application for Valmiki Ramayana Reader."""
 
 import sqlite3
+import json
 import dill
 from pathlib import Path
 
@@ -665,6 +666,19 @@ def icon():
     </svg>
     """.strip()
     return Response(svg, media_type='image/svg+xml')
+
+
+@rt('/.well-known/assetlinks.json')
+def assetlinks():
+    """Serve Digital Asset Links for TWA verification."""
+    path = Path(__file__).resolve().parents[2] / 'assetlinks.json'
+    if not path.exists():
+        return Response('assetlinks.json not found', status_code=404)
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError:
+        return Response('Invalid assetlinks.json', status_code=500)
+    return JSONResponse(payload)
 
 
 @rt('/threads/new')
