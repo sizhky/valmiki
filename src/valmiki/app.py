@@ -3,6 +3,9 @@
 import sqlite3
 import json
 import time
+import os
+import threading
+import logging
 from urllib.parse import quote
 from pathlib import Path
 
@@ -19,6 +22,8 @@ rt = app.route
 # In-memory storage
 sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
+_thread_local = threading.local()
+_logger = logging.getLogger(__name__)
 DEFAULT_LANGUAGE = 'te'
 MAX_KANDA = 6
 DEFAULT_USER_ID = 1
@@ -60,23 +65,66 @@ class CachedSarga:
         return self._slokas
 
 
-def _get_conn():
-    """Open a SQLite connection with a row factory."""
+def _log_conn_failure(exc: sqlite3.OperationalError) -> None:
+    try:
+        parent = db_path.parent
+        _logger.error(
+            "SQLite open failed: %s | db=%s cwd=%s uid=%s gid=%s parent_exists=%s parent_writable=%s",
+            exc,
+            db_path,
+            os.getcwd(),
+            os.geteuid() if hasattr(os, "geteuid") else "n/a",
+            os.getegid() if hasattr(os, "getegid") else "n/a",
+            parent.exists(),
+            os.access(parent, os.W_OK),
+        )
+    except Exception:
+        _logger.exception("SQLite open failed and diagnostics could not be collected")
+
+
+def _configure_conn(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
+    try:
+        conn.execute('PRAGMA journal_mode = WAL')
+    except sqlite3.OperationalError:
+        conn.execute('PRAGMA journal_mode = DELETE')
+    conn.execute('PRAGMA synchronous = NORMAL')
+    conn.execute('PRAGMA busy_timeout = 5000')
+
+
+def _open_conn() -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    last_error = None
-    for _ in range(3):
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(1, 6):
         try:
-            conn = sqlite3.connect(db_path, timeout=5)
-            conn.row_factory = sqlite3.Row
-            conn.execute('PRAGMA foreign_keys = ON')
-            conn.execute('PRAGMA journal_mode = WAL')
-            conn.execute('PRAGMA synchronous = NORMAL')
-            conn.execute('PRAGMA busy_timeout = 3000')
+            conn = sqlite3.connect(db_path, timeout=10)
+            _configure_conn(conn)
             return conn
         except sqlite3.OperationalError as exc:
             last_error = exc
-            time.sleep(0.05)
+            time.sleep(0.05 * attempt)
+    assert last_error is not None
+    _log_conn_failure(last_error)
     raise last_error
+
+
+def _get_conn():
+    """Get a per-thread SQLite connection with retries."""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except sqlite3.Error:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            _thread_local.conn = None
+    conn = _open_conn()
+    _thread_local.conn = conn
+    return conn
 
 
 def _load_sarga_from_cache(kanda: int, sarga: int):
