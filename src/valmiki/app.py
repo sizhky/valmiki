@@ -29,6 +29,15 @@ stats_cache = {
     'ramayana_prefix': {},
 }
 
+KANDA_NAMES = {
+    1: 'Bāla Kāṇḍa',
+    2: 'Ayodhyā Kāṇḍa',
+    3: 'Araṇya Kāṇḍa',
+    4: 'Kiṣkindhā Kāṇḍa',
+    5: 'Sundara Kāṇḍa',
+    6: 'Yuddha Kāṇḍa',
+}
+
 # Translation caches (for future translator integration)
 translation_cache = {
     'te': {},  # Telugu translations: {english_text: telugu_text}
@@ -537,6 +546,14 @@ def _parse_int(value: str | None, default: int) -> int:
         return default
 
 
+def _ordinal(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = 'th'
+    else:
+        suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f'{n}{suffix}'
+
+
 def _thread_title_fragment(thread_id: int, title: str):
     return Div(
         H3(
@@ -894,6 +911,15 @@ def home():
                     *new_thread_links,
                     style='max-width:700px; margin:0 auto; padding:20px'
                 ),
+                Div(
+                    P(
+                        A('Source: valmiki.iitk.ac.in',
+                          href='https://www.valmiki.iitk.ac.in/',
+                          style='color:#666; text-decoration:none'),
+                        style='text-align:center; font-size:0.9em; padding:20px 0'
+                    ),
+                    style='border-top:1px solid #222; margin-top:30px'
+                ),
                 style='min-height:100vh; background:black'
             )
         )
@@ -970,6 +996,8 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     
     # English translation (Telugu sloka shown above)
     bhaavam = bhaavam_en
+    if 'ఇత్యార్షే' in bhaavam:
+        bhaavam = bhaavam.split('ఇత్యార్షే', 1)[0].strip()
     
     # Check if bookmarked
     is_bookmarked = _is_bookmarked(thread_id, kanda, sarga, sloka_num)
@@ -984,10 +1012,20 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     ''')
     
     # Sloka content
+    end_marker = None
+    if sloka_num == len(sr):
+        kanda_name = KANDA_NAMES.get(kanda, f'Kāṇḍa {kanda}')
+        end_marker = Div(
+            Div('✦ ✦ ✦', style='color:#fbbf24; text-align:center; font-size:1.2em; margin:30px 0 10px'),
+            P(f'End of {_ordinal(sarga)} Sarga of {kanda_name}', style='text-align:center; color:#888; font-size:1.05em'),
+            style='margin-top:30px'
+        )
+
     sloka_content = Div(
         H4(sloka_data['sloka_num'], style='text-align:center; font-size:1.5em; color:#888; margin-bottom:20px'),
         H3(sloka_text, cls='telugu-text', style='text-align:center; white-space:pre-line; font-size:1.8em; line-height:1.8; margin-bottom:40px'),
         H2(bhaavam, style='text-align:center; font-size:1.3em; line-height:1.6; color:#ccc; max-width:700px; margin:0 auto'),
+        end_marker if end_marker else None,
         style='max-width:900px; margin:0 auto'
     )
     
@@ -1056,8 +1094,6 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 }
             ),
             A('📚', href=_with_thread('/bookmarks', thread_id), 
-              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-            A('🧵', href=f'/threads/new?kanda={kanda}&sarga={sarga}&sloka={sloka_num}',
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),
             A('⛶', href='#', id='fullscreen-btn',
               style='text-decoration:none; font-size:1.5em; margin-left:15px'),

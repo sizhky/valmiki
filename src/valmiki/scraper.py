@@ -52,6 +52,7 @@ class SargaReader:
         
         # Cache for parsed slokas to avoid re-parsing
         self._sloka_cache = {}
+        self._slokas = None
     
     def extract_sloka(self, row) -> dict:
         """
@@ -124,8 +125,12 @@ class SargaReader:
         Raises:
             IndexError: If index is out of range
         """
-        if index < 0 or index >= len(self.rows):
-            raise IndexError(f"Sloka index {index} out of range (0-{len(self.rows)-1})")
+        total = len(self)
+        if index < 0 or index >= total:
+            raise IndexError(f"Sloka index {index} out of range (0-{total-1})")
+
+        if self._slokas is not None:
+            return self._slokas[index]
         
         # Check cache first to avoid re-parsing
         if index not in self._sloka_cache:
@@ -140,10 +145,14 @@ class SargaReader:
         Returns:
             List of dictionaries containing structured sloka data
         """
-        return [self.extract_sloka(row) for row in self.rows]
+        if self._slokas is None:
+            self._slokas = [self.extract_sloka(row) for row in self.rows]
+        return self._slokas
     
     def __len__(self) -> int:
         """Return the number of slokas in this sarga."""
+        if self._slokas is not None:
+            return len(self._slokas)
         return len(self.rows)
     
     def __getitem__(self, index: int) -> dict:
@@ -153,6 +162,25 @@ class SargaReader:
     def __repr__(self) -> str:
         """String representation of the reader."""
         return f"SargaReader(kanda={self.kanda_num}, sarga={self.sarga_num}, lang='{self.lang}', slokas={len(self)})"
+
+    def __getstate__(self) -> dict:
+        slokas = self.get_all_slokas()
+        return {
+            'kanda_num': self.kanda_num,
+            'sarga_num': self.sarga_num,
+            'lang': self.lang,
+            'slokas': slokas,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        self.kanda_num = state['kanda_num']
+        self.sarga_num = state['sarga_num']
+        self.lang = state.get('lang', 'te')
+        self.url = f"{self.BASE_URL}?field_kanda_tid={self.kanda_num}&language={self.lang}&field_sarga_value={self.sarga_num}"
+        self.soup = None
+        self.rows = []
+        self._sloka_cache = {}
+        self._slokas = state.get('slokas', [])
 
 
 @lru_cache(maxsize=128)
