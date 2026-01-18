@@ -648,6 +648,15 @@ def manifest():
     return JSONResponse(payload, media_type='application/manifest+json')
 
 
+@rt('/static/favicon.png')
+def favicon_png():
+    """Serve site favicon."""
+    path = Path(__file__).resolve().parents[2] / 'static' / 'favicon.png'
+    if not path.exists():
+        return Response('favicon not found', status_code=404)
+    return Response(path.read_bytes(), media_type='image/png')
+
+
 @rt('/icon.svg')
 def icon():
     """Simple SVG icon for PWA."""
@@ -749,13 +758,17 @@ def home():
     return Html(
         Head(
             Title('Valmiki Ramayana Reader'),
+            Link(rel='icon', href='/static/favicon.png', type='image/png'),
             Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
             Meta(name='theme-color', content='#000000'),
             Meta(name='apple-mobile-web-app-capable', content='yes'),
             Meta(name='apple-mobile-web-app-status-bar-style', content='black-translucent'),
             Meta(name='apple-mobile-web-app-title', content='Valmiki'),
             Link(rel='manifest', href='/manifest.webmanifest'),
-            Style('* { margin:0; padding:0; box-sizing:border-box; }'),
+            Style('''
+                * { margin:0; padding:0; box-sizing:border-box; }
+                body { font-family: system-ui, -apple-system, sans-serif; }
+            '''),
             Script(src='https://unpkg.com/htmx.org@1.9.12')
         ),
         Body(
@@ -851,7 +864,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     # Sloka content
     sloka_content = Div(
         H4(sloka_data['sloka_num'], style='text-align:center; font-size:1.5em; color:#888; margin-bottom:20px'),
-        H3(sloka_text, style='text-align:center; white-space:pre-line; font-size:1.8em; line-height:1.8; margin-bottom:40px'),
+        H3(sloka_text, cls='telugu-text', style='text-align:center; white-space:pre-line; font-size:1.8em; line-height:1.8; margin-bottom:40px'),
         H2(bhaavam, style='text-align:center; font-size:1.3em; line-height:1.6; color:#ccc; max-width:700px; margin:0 auto'),
         style='max-width:900px; margin:0 auto'
     )
@@ -1014,6 +1027,10 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     return Html(
         Head(
             Title(f'Sloka {sloka_data["sloka_num"]} - Valmiki Ramayana'),
+            Link(rel='icon', href='/static/favicon.png', type='image/png'),
+            Link(rel='preconnect', href='https://fonts.googleapis.com'),
+            Link(rel='preconnect', href='https://fonts.gstatic.com', crossorigin='true'),
+            Link(rel='stylesheet', href='https://fonts.googleapis.com/css2?family=Peddana&display=swap'),
             Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
             Meta(name='theme-color', content='#000000'),
             Meta(name='apple-mobile-web-app-capable', content='yes'),
@@ -1023,6 +1040,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             Script(src='https://unpkg.com/htmx.org@1.9.12'),
             Style('''
                 * { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, -apple-system, sans-serif; }
+                .telugu-text { font-family: "Peddana", "Noto Sans Telugu", serif; font-weight: 400; }
                 
                 /* Rotation hint - hidden by default */
                 .rotation-hint {
@@ -1177,6 +1195,7 @@ def get_bookmarks(request: Request):
     return Html(
         Head(
             Title(f'{title} - Valmiki Ramayana'),
+            Link(rel='icon', href='/static/favicon.png', type='image/png'),
             Meta(name='viewport', content='width=device-width, initial-scale=1, viewport-fit=cover'),
             Meta(name='theme-color', content='#000000'),
             Meta(name='apple-mobile-web-app-capable', content='yes'),
