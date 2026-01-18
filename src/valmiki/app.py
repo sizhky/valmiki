@@ -20,6 +20,13 @@ db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 DEFAULT_LANGUAGE = 'te'
 sarga_cache_dir = (Path(__file__).resolve().parents[2] / 'data' / 'sarga_cache')
 MAX_KANDA = 6
+stats_cache = {
+    'ramayana_total': None,
+    'kanda_totals': {},
+    'kanda_sargas': {},
+    'kanda_prefix': {},
+    'ramayana_prefix': {},
+}
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -90,13 +97,18 @@ def _get_sarga_len(kanda: int, sarga: int) -> int:
 
 
 def _get_kanda_total_slokas(kanda: int) -> int:
+    cached = stats_cache['kanda_totals'].get(kanda)
+    if cached is not None:
+        return cached
     with _get_conn() as conn:
         row = conn.execute(
             'SELECT total_slokas FROM kanda_stats WHERE kanda = ?',
             (kanda,),
         ).fetchone()
         if row:
-            return int(row['total_slokas'])
+            total = int(row['total_slokas'])
+            stats_cache['kanda_totals'][kanda] = total
+            return total
         row = conn.execute(
             'SELECT COALESCE(SUM(sloka_count), 0) AS total FROM sarga_stats WHERE kanda = ?',
             (kanda,),
@@ -118,6 +130,9 @@ def _get_kanda_total_slokas(kanda: int) -> int:
                 ''',
                 (kanda, total_sargas, total_slokas),
             )
+            stats_cache['kanda_totals'][kanda] = total_slokas
+            if total_sargas:
+                stats_cache['kanda_sargas'][kanda] = total_sargas
             return total_slokas
 
     total_slokas = 0
@@ -146,60 +161,81 @@ def _get_kanda_total_slokas(kanda: int) -> int:
             ''',
             (kanda, total_sargas, total_slokas),
         )
+    stats_cache['kanda_totals'][kanda] = total_slokas
+    if total_sargas:
+        stats_cache['kanda_sargas'][kanda] = total_sargas
     return total_slokas
 
 
 def _get_kanda_total_sargas(kanda: int) -> int:
+    cached = stats_cache['kanda_sargas'].get(kanda)
+    if cached is not None:
+        return cached
     with _get_conn() as conn:
         row = conn.execute(
             'SELECT total_sargas FROM kanda_stats WHERE kanda = ?',
             (kanda,),
         ).fetchone()
         if row and int(row['total_sargas']) > 0:
-            return int(row['total_sargas'])
+            total = int(row['total_sargas'])
+            stats_cache['kanda_sargas'][kanda] = total
+            return total
         row = conn.execute(
             'SELECT COUNT(*) AS count FROM sarga_stats WHERE kanda = ?',
             (kanda,),
         ).fetchone()
         if row and int(row['count']) > 0:
-            return int(row['count'])
+            total = int(row['count'])
+            stats_cache['kanda_sargas'][kanda] = total
+            return total
     return 0
 
 
 def _get_kanda_progress_slokas(kanda: int, sarga: int, sloka_num: int) -> int:
-    with _get_conn() as conn:
-        row = conn.execute(
-            '''
-            SELECT COALESCE(SUM(sloka_count), 0) AS total
-            FROM sarga_stats
-            WHERE kanda = ? AND sarga < ?
-            ''',
-            (kanda, sarga),
-        ).fetchone()
-    done = int(row['total']) if row else 0
-    return done + sloka_num
+    prefix = stats_cache['kanda_prefix'].get((kanda, sarga))
+    if prefix is None:
+        with _get_conn() as conn:
+            row = conn.execute(
+                '''
+                SELECT COALESCE(SUM(sloka_count), 0) AS total
+                FROM sarga_stats
+                WHERE kanda = ? AND sarga < ?
+                ''',
+                (kanda, sarga),
+            ).fetchone()
+        prefix = int(row['total']) if row else 0
+        stats_cache['kanda_prefix'][(kanda, sarga)] = prefix
+    return prefix + sloka_num
 
 
 def _get_ramayana_total_slokas() -> int:
+    cached = stats_cache['ramayana_total']
+    if cached is not None:
+        return cached
     with _get_conn() as conn:
         row = conn.execute(
             'SELECT COALESCE(SUM(sloka_count), 0) AS total FROM sarga_stats'
         ).fetchone()
-    return int(row['total']) if row else 0
+    total = int(row['total']) if row else 0
+    stats_cache['ramayana_total'] = total
+    return total
 
 
 def _get_ramayana_progress_slokas(kanda: int, sarga: int, sloka_num: int) -> int:
-    with _get_conn() as conn:
-        row = conn.execute(
-            '''
-            SELECT COALESCE(SUM(sloka_count), 0) AS total
-            FROM sarga_stats
-            WHERE kanda < ?
-            ''',
-            (kanda,),
-        ).fetchone()
-    done = int(row['total']) if row else 0
-    return done + _get_kanda_progress_slokas(kanda, sarga, sloka_num)
+    prefix = stats_cache['ramayana_prefix'].get(kanda)
+    if prefix is None:
+        with _get_conn() as conn:
+            row = conn.execute(
+                '''
+                SELECT COALESCE(SUM(sloka_count), 0) AS total
+                FROM sarga_stats
+                WHERE kanda < ?
+                ''',
+                (kanda,),
+            ).fetchone()
+        prefix = int(row['total']) if row else 0
+        stats_cache['ramayana_prefix'][kanda] = prefix
+    return prefix + _get_kanda_progress_slokas(kanda, sarga, sloka_num)
 
 
 def _get_sarga_reader(kanda: int, sarga: int) -> SargaReader:
@@ -920,9 +956,9 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             # Right arrow
             Div(
                 A('→', href=next_url, id='next',
-                  style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:#1a1a1a; color:white; width:100%; transition: background 0.2s',
-                  onmouseover='this.style.background="#2d2d2d"',
-                  onmouseout='this.style.background="#1a1a1a"',
+                  style='font-size:3em; text-decoration:none; display:flex; align-items:center; justify-content:center; height:100vh; background:black; color:white; width:100%; transition: background 0.2s',
+                  onmouseover='this.style.background="#1a1a1a"',
+                  onmouseout='this.style.background="black"',
                   **{
                       'hx-get': next_url,
                       'hx-target': '#sloka-view',
