@@ -901,7 +901,7 @@ def _new_thread_prompt_fragment():
             Div(
                 P('Kanda', style='color:#888; font-size:0.9em; margin-bottom:6px'),
                 Select(
-                    *[Option(str(k), value=str(k)) for k in range(1, MAX_KANDA + 1)],
+                    *[Option(_kanda_display_name(k), value=str(k)) for k in range(1, MAX_KANDA + 1)],
                     name='kanda',
                     **{
                         'hx-get': '/threads/sarga-options',
@@ -1146,7 +1146,7 @@ def login(request: Request):
                         Label('Starting Kāṇḍa'),
                         Select(
                             *[
-                                Option(KANDA_NAMES.get(k, f'Kāṇḍa {k}'), value=str(k))
+                                Option(_kanda_display_name(k), value=str(k))
                                 for k in range(1, MAX_KANDA + 1)
                             ],
                             name='kanda',
