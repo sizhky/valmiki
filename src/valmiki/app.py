@@ -24,6 +24,7 @@ sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaRea
 db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
 _thread_local = threading.local()
 _logger = logging.getLogger(__name__)
+ANON_COOKIE = 'valmiki_anon'
 DEFAULT_LANGUAGE = 'te'
 MAX_KANDA = 6
 DEFAULT_USER_ID = 1
@@ -758,11 +759,27 @@ def _get_user_id(request: Request) -> int | None:
     return user_id
 
 
+def _is_anonymous(request: Request) -> bool:
+    return request.cookies.get(ANON_COOKIE) == '1'
+
+
 def _set_user_cookie(response: Response, user_id: int) -> None:
     max_age = 60 * 60 * 24 * 365 * 10
     response.set_cookie(
         'valmiki_user',
         str(user_id),
+        max_age=max_age,
+        httponly=True,
+        samesite='lax',
+        path='/',
+    )
+
+
+def _set_anon_cookie(response: Response) -> None:
+    max_age = 60 * 60 * 24 * 365
+    response.set_cookie(
+        ANON_COOKIE,
+        '1',
         max_age=max_age,
         httponly=True,
         samesite='lax',
@@ -1056,6 +1073,10 @@ def login(request: Request):
     next_path = request.query_params.get('next', '/')
     if not next_path.startswith('/'):
         next_path = '/'
+    kanda_counts = []
+    for k in range(1, MAX_KANDA + 1):
+        total = _get_kanda_total_sargas(k)
+        kanda_counts.append(int(total) if total and total > 0 else 1)
     return Html(
         Head(
             Title('Valmiki - Login'),
@@ -1070,6 +1091,9 @@ def login(request: Request):
                 .row { margin-bottom:20px; }
                 button { padding:12px 16px; border-radius:10px; border:none; background:#fbbf24; color:black; font-weight:600; cursor:pointer; width:100%; }
                 .hint { color:#888; font-size:0.9em; margin-top:6px; }
+                .ghost { background:#111; color:#fbbf24; border:1px solid #333; }
+                .sep-wrap { margin:28px auto; width:100%; max-width:520px; }
+                select { width:100%; padding:12px 14px; border-radius:10px; border:1px solid #333; background:#111; color:white; font-size:1em; }
             '''),
         ),
         Body(
@@ -1097,8 +1121,88 @@ def login(request: Request):
                     class_='card',
                     action='/login/submit',
                     method='post',
+                    style='margin-bottom:18px',
                 ),
-            )
+                Div(
+                    Div(
+                        Hr(style='width:100%; border:none; height:8px; background:#fbbf24; border-radius:999px; display:block; margin:0;'),
+                        Span('OR', style='position:absolute; left:50%; top:50%; transform:translate(-50%, -50%); background:black; color:#fbbf24; font-weight:800; letter-spacing:0.2em; font-size:1.05em; padding:0 14px;'),
+                        style='position:relative; width:100%; height:36px; display:flex; align-items:center; justify-content:center;',
+                    ),
+                    class_='sep-wrap',
+                ),
+                Form(
+                    Div(
+                        Label('Starting Kāṇḍa'),
+                        Select(
+                            *[
+                                Option(KANDA_NAMES.get(k, f'Kāṇḍa {k}'), value=str(k))
+                                for k in range(1, MAX_KANDA + 1)
+                            ],
+                            name='kanda',
+                            id='anon-kanda',
+                        ),
+                        style='margin-bottom:16px',
+                    ),
+                    Div(
+                        Label('Starting Sarga'),
+                        Select(
+                            *[
+                                Option(str(i), value=str(i))
+                                for i in range(1, kanda_counts[0] + 1)
+                            ],
+                            name='sarga',
+                            id='anon-sarga',
+                        ),
+                        style='margin-bottom:20px',
+                    ),
+                    Input(type='hidden', name='next', value=next_path),
+                    Button('Continue as Anonymous', type='submit', class_='ghost'),
+                    class_='card',
+                    action='/login/anonymous',
+                    method='post',
+                    style='margin-top:16px'
+                ),
+                P('Anonymous mode skips threads and bookmarks.', style='text-align:center; color:#666; margin-top:10px; font-size:0.9em'),
+            ),
+            Script(f'''
+                const kandaCounts = {json.dumps(kanda_counts)};
+                const kandaSelect = document.getElementById('anon-kanda');
+                const sargaSelect = document.getElementById('anon-sarga');
+                const LAST_KANDA_KEY = 'anonLastKanda';
+                const LAST_SARGA_KEY = 'anonLastSarga';
+                const renderSargas = (kandaValue) => {{
+                    const idx = Math.max(1, Math.min(parseInt(kandaValue, 10) || 1, kandaCounts.length)) - 1;
+                    const count = kandaCounts[idx] || 1;
+                    sargaSelect.innerHTML = '';
+                    for (let i = 1; i <= count; i++) {{
+                        const opt = document.createElement('option');
+                        opt.value = String(i);
+                        opt.textContent = String(i);
+                        sargaSelect.appendChild(opt);
+                    }}
+                }};
+                const applyRemembered = () => {{
+                    const rememberedKanda = localStorage.getItem(LAST_KANDA_KEY);
+                    if (rememberedKanda) {{
+                        kandaSelect.value = rememberedKanda;
+                    }}
+                    renderSargas(kandaSelect.value);
+                    const rememberedSarga = localStorage.getItem(LAST_SARGA_KEY);
+                    if (rememberedSarga) {{
+                        sargaSelect.value = rememberedSarga;
+                    }}
+                }};
+                applyRemembered();
+                kandaSelect.addEventListener('change', (e) => {{
+                    localStorage.setItem(LAST_KANDA_KEY, e.target.value);
+                    renderSargas(e.target.value);
+                    localStorage.removeItem(LAST_SARGA_KEY);
+                }});
+                sargaSelect.addEventListener('change', (e) => {{
+                    localStorage.setItem(LAST_SARGA_KEY, e.target.value);
+                }});
+            ''')
         ),
     )
 
@@ -1139,6 +1243,28 @@ async def login_post(request: Request):
                 )
     response = RedirectResponse(next_path, status_code=303)
     _set_user_cookie(response, user_id)
+    response.delete_cookie(ANON_COOKIE, path='/')
+    return response
+
+
+@rt('/login/anonymous', methods=['POST'])
+async def login_anonymous(request: Request):
+    form = await request.form()
+    next_path = str(form.get('next', '/')).strip()
+    if not next_path.startswith('/'):
+        next_path = '/'
+    kanda = _parse_int(str(form.get('kanda')), 1)
+    kanda = min(max(kanda, 1), MAX_KANDA)
+    sarga = _parse_int(str(form.get('sarga')), 1)
+    sarga_total = _get_kanda_total_sargas(kanda)
+    if not sarga_total or sarga_total < 1:
+        sarga_total = 1
+    sarga = min(max(sarga, 1), sarga_total)
+    if next_path == '/':
+        next_path = f'/kanda/{kanda}/sarga/{sarga}/sloka/1'
+    response = RedirectResponse(next_path, status_code=303)
+    _set_anon_cookie(response)
+    response.delete_cookie('valmiki_user', path='/')
     return response
 
 
@@ -1146,6 +1272,7 @@ async def login_post(request: Request):
 def logout():
     response = RedirectResponse('/login', status_code=303)
     response.delete_cookie('valmiki_user', path='/')
+    response.delete_cookie(ANON_COOKIE, path='/')
     return response
 
 
@@ -1253,6 +1380,8 @@ def home(request: Request):
     """Home page with reading threads."""
     user_id = _get_user_id(request)
     if not user_id:
+        if _is_anonymous(request):
+            return RedirectResponse('/kanda/1/sarga/1/sloka/1', status_code=303)
         return _login_redirect(request)
     user = _get_user(user_id)
     first_name = user['first_name'] if user else 'Your'
@@ -1318,9 +1447,12 @@ def home(request: Request):
 async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Display a single sloka with navigation."""
     user_id = _get_user_id(request)
-    if not user_id:
+    is_anon = _is_anonymous(request)
+    if not user_id and not is_anon:
         return _login_redirect(request)
-    thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
+    thread_id = None
+    if user_id:
+        thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     
     # Get or create SargaReader for this sarga
     try:
@@ -1376,9 +1508,9 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
             # Go to next sarga
             next_url = f'/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
 
-    if prev_url != '#':
+    if thread_id and prev_url != '#':
         prev_url = _with_thread(prev_url, thread_id)
-    if next_url != '#':
+    if thread_id and next_url != '#':
         next_url = _with_thread(next_url, thread_id)
     
     # Render sloka content
@@ -1391,7 +1523,9 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         bhaavam = bhaavam.split('ఇత్యార్షే', 1)[0].strip()
     
     # Check if bookmarked
-    is_bookmarked = _is_bookmarked(thread_id, kanda, sarga, sloka_num)
+    is_bookmarked = False
+    if thread_id is not None:
+        is_bookmarked = _is_bookmarked(thread_id, kanda, sarga, sloka_num)
     bookmark_fill = '#fbbf24' if is_bookmarked else 'none'
     
     # Bookmark icon SVG
@@ -1428,8 +1562,9 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     ramayana_done = _get_ramayana_progress_slokas(kanda, sarga, sloka_num)
     ramayana_pct = (ramayana_done / max(ramayana_total, 1)) * 100
 
-    sloka_view = Div(
-        Div(
+    mark_read_fragment = None
+    if thread_id is not None:
+        mark_read_fragment = Div(
             '',
             id='mark-read',
             **{
@@ -1437,7 +1572,35 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 'hx-trigger': 'load',
                 'hx-swap': 'none',
             }
-        ),
+        )
+
+    top_right_controls = [
+        A('⛶', href='#', id='fullscreen-btn',
+          style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+        A('🏠', href='/' if user_id else '/login',
+          style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+    ]
+    if thread_id is not None:
+        top_right_controls.insert(
+            0,
+            A(
+                bookmark_icon,
+                href='#',
+                id='bookmark-link',
+                style='text-decoration:none',
+                **{
+                    'data-bookmark-url': f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}'
+                }
+            ),
+        )
+        top_right_controls.insert(
+            1,
+            A('📚', href=_with_thread('/bookmarks', thread_id),
+              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+        )
+
+    sloka_view = Div(
+        *([mark_read_fragment] if mark_read_fragment else []),
         # Rotation hint overlay
         Div(
             Span('🔄', style='font-size:1.5em'),
@@ -1475,21 +1638,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
         
         # Top-right controls
         Div(
-            A(
-                bookmark_icon,
-                href='#',
-                id='bookmark-link',
-                style='text-decoration:none',
-                **{
-                    'data-bookmark-url': f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}/bookmark?thread={thread_id}'
-                }
-            ),
-            A('📚', href=_with_thread('/bookmarks', thread_id), 
-              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-            A('⛶', href='#', id='fullscreen-btn',
-              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
-            A('🏠', href='/', 
-              style='text-decoration:none; font-size:1.5em; margin-left:15px'),
+            *top_right_controls,
             style='position:fixed; top:20px; right:20px; z-index:1000; display:flex; gap:10px; align-items:center'
         ),
         
@@ -1564,6 +1713,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 }}
             }};
             document.addEventListener('keydown', window._slokaKeyHandler);
+            {f"localStorage.setItem('anonLastKanda', '{kanda}'); localStorage.setItem('anonLastSarga', '{sarga}');" if is_anon else ""}
         '''),
         
         id='sloka-view',
@@ -1674,7 +1824,7 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
 
                 document.addEventListener('htmx:afterSwap', refreshFsHint);
                 refreshFsHint();
-            ''')
+            '''),
         )
     )
 
@@ -1684,6 +1834,8 @@ def toggle_bookmark(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Toggle bookmark status for a sloka."""
     user_id = _get_user_id(request)
     if not user_id:
+        if _is_anonymous(request):
+            return JSONResponse({'error': 'anonymous'}, status_code=403)
         return _login_redirect(request)
     thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     bookmarked = _toggle_bookmark(thread_id, kanda, sarga, sloka_num)
@@ -1696,6 +1848,8 @@ def mark_read(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Mark a sloka as last read position."""
     user_id = _get_user_id(request)
     if not user_id:
+        if _is_anonymous(request):
+            return JSONResponse({'error': 'anonymous'}, status_code=403)
         return _login_redirect(request)
     thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     _update_progress(thread_id, kanda, sarga, sloka_num)
