@@ -6,7 +6,6 @@ import time
 import os
 import threading
 import logging
-import unicodedata
 from urllib.parse import quote
 from pathlib import Path
 
@@ -48,10 +47,7 @@ KANDA_NAMES = {
 
 
 def _kanda_display_name(kanda: int) -> str:
-    name = KANDA_NAMES.get(kanda)
-    if not name:
-        return f'Kanda {kanda}'
-    return unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    return KANDA_NAMES.get(kanda, f'Kāṇḍa {kanda}')
 
 # Translation caches (for future translator integration)
 translation_cache = {
