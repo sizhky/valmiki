@@ -6,6 +6,7 @@ import time
 import os
 import threading
 import logging
+import unicodedata
 from urllib.parse import quote
 from pathlib import Path
 
@@ -44,6 +45,13 @@ KANDA_NAMES = {
     5: 'Sundara Kāṇḍa',
     6: 'Yuddha Kāṇḍa',
 }
+
+
+def _kanda_display_name(kanda: int) -> str:
+    name = KANDA_NAMES.get(kanda)
+    if not name:
+        return f'Kanda {kanda}'
+    return unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
 
 # Translation caches (for future translator integration)
 translation_cache = {
@@ -965,12 +973,14 @@ def _thread_card_fragment(thread):
         progress_text = 'No progress yet'
     else:
         resume_url = _with_thread(f'/kanda/{k}/sarga/{s}/sloka/{sl}', thread['id'])
-        progress_text = f'Kanda {k} Sarga {s} Sloka {sl}'
+        progress_text = f'Sloka {sl}', f'Sarga {s}', _kanda_display_name(k)
 
     return Div(
         Div(
             _thread_title_fragment(thread['id'], thread['name']),
-            P(progress_text, style='color:#ccc; margin-top:8px'),
+            P(progress_text[0], style='color:#ccc; margin-top:8px'),
+            P(progress_text[1], style='color:#ddd; margin-top:4px; font-size:1.01em'),
+            P(progress_text[2], style='color:#eee; margin-top:4px; font-size:1.02em; margin-bottom:12px'),
             style='flex:1'
         ),
         Div(
