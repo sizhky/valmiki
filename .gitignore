@@ -1,0 +1,16 @@
+# Runtime data
+data/*.db
+data/*.db-*
+data/*.db.*
+data/*recover*.sql
+data/logs/
+
+# Python build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local environments and caches
+.venv/
+.pytest_cache/
+.ruff_cache/
