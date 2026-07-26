@@ -39,16 +39,28 @@ class SargaReader:
         Raises:
             httpx.HTTPError: If the request fails
         """
+        if not 1 <= kanda_num <= 6:
+            raise ValueError(f"Kanda must be between 1 and 6, got {kanda_num}")
+        if sarga_num < 1:
+            raise ValueError(f"Sarga must be positive, got {sarga_num}")
         self.kanda_num = kanda_num
         self.sarga_num = sarga_num
         self.lang = lang
         self.url = f"{self.BASE_URL}?field_kanda_tid={kanda_num}&language={lang}&field_sarga_value={sarga_num}"
         
         # Fetch and parse the HTML
-        response = httpx.get(self.url)
+        response = httpx.get(
+            self.url,
+            timeout=httpx.Timeout(20.0, connect=5.0),
+            follow_redirects=True,
+        )
         response.raise_for_status()
         self.soup = BeautifulSoup(response.text, 'lxml')
         self.rows = self.soup.select('.views-row')
+        if not self.rows:
+            raise ValueError(
+                f"Upstream returned no slokas for kanda={kanda_num}, sarga={sarga_num}"
+            )
         
         # Cache for parsed slokas to avoid re-parsing
         self._sloka_cache = {}
@@ -75,20 +87,27 @@ class SargaReader:
         
         # Parse body text to extract sloka number and verse text
         body_text = body.get_text('\n', strip=True)
-        lines = [l.strip() for l in body_text.split('\n') if l.strip()]
+        lines = [line.strip() for line in body_text.split('\n') if line.strip()]
         
         # Extract sloka number (format: ৷৷1.1.1৷৷)
         sloka_num = next(
-            (re.search(r'৷৷([\d.]+)৷৷', l).group(1) for l in lines if re.search(r'৷৷[\d.]+৷৷', l)),
+            (
+                re.search(r'৷৷([\d.]+)৷৷', line).group(1)
+                for line in lines
+                if re.search(r'৷৷[\d.]+৷৷', line)
+            ),
             None
         )
         
         # Extract sloka text (excluding metadata and sloka number)
         sloka_lines = [
-            re.sub(r'\s*৷৷[\d.]+৷৷\s*', '', l)  # Remove sloka number markers
-            for l in lines
-            if not l.startswith('[')  # Exclude metadata in square brackets
-            and any(c not in ' .,।৷' for c in re.sub(r'৷৷[\d.]+৷৷', '', l))  # Has actual content
+            re.sub(r'\s*৷৷[\d.]+৷৷\s*', '', line)  # Remove sloka number markers
+            for line in lines
+            if not line.startswith('[')  # Exclude metadata in square brackets
+            and any(
+                character not in ' .,।৷'
+                for character in re.sub(r'৷৷[\d.]+৷৷', '', line)
+            )
         ]
         sloka_text = '\n'.join(sloka_lines).strip()
         

@@ -31,6 +31,7 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
     "dill>=0.3.8",
+    "loguru>=0.7.2",
     "uvicorn>=0.40.0",
     "python-fasthtml>=0.12.39",
 ]
@@ -74,3 +75,6 @@ target-version = ['py310', 'py311', 'py312']
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+"src/valmiki/app.py" = ["F403", "F405"]

@@ -5,25 +5,28 @@ import json
 import time
 import os
 import threading
-import logging
+from datetime import datetime, timezone
 from urllib.parse import quote
 from pathlib import Path
 
 from fasthtml.common import *
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, JSONResponse
+from loguru import logger
 
-from .scraper import SargaReader
+from .navigation import ReadingPosition, build_navigation
+from .observability import configure_logging, install_request_logging
+from .sarga_cache import SargaCache
 
 # Initialize FastHTML app
 app = FastHTML()
 rt = app.route
+_data_dir = Path(os.getenv("VALMIKI_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+configure_logging(_data_dir / "logs")
+install_request_logging(app)
 
-# In-memory storage
-sarga_readers = {}  # Cache for SargaReader instances: {(kanda, sarga): SargaReader}
-db_path = (Path(__file__).resolve().parents[2] / 'data' / 'valmiki.db')
+db_path = Path(os.getenv("VALMIKI_DB_PATH", _data_dir / "valmiki.db"))
 _thread_local = threading.local()
-_logger = logging.getLogger(__name__)
 ANON_COOKIE = 'valmiki_anon'
 DEFAULT_LANGUAGE = 'te'
 MAX_KANDA = 6
@@ -45,7 +48,6 @@ KANDA_NAMES = {
     6: 'Yuddha Kāṇḍa',
 }
 
-
 def _kanda_display_name(kanda: int) -> str:
     return KANDA_NAMES.get(kanda, f'Kāṇḍa {kanda}')
 
@@ -56,35 +58,21 @@ translation_cache = {
 }
 
 
-class CachedSarga:
-    def __init__(self, slokas: list[dict]) -> None:
-        self._slokas = slokas
-
-    def __len__(self) -> int:
-        return len(self._slokas)
-
-    def __getitem__(self, index: int) -> dict:
-        return self._slokas[index]
-
-    def get_all_slokas(self) -> list[dict]:
-        return self._slokas
-
-
 def _log_conn_failure(exc: sqlite3.OperationalError) -> None:
     try:
         parent = db_path.parent
-        _logger.error(
-            "SQLite open failed: %s | db=%s cwd=%s uid=%s gid=%s parent_exists=%s parent_writable=%s",
-            exc,
-            db_path,
-            os.getcwd(),
-            os.geteuid() if hasattr(os, "geteuid") else "n/a",
-            os.getegid() if hasattr(os, "getegid") else "n/a",
-            parent.exists(),
-            os.access(parent, os.W_OK),
-        )
+        logger.bind(
+            event="database_open_failed",
+            database=str(db_path),
+            cwd=os.getcwd(),
+            uid=os.geteuid() if hasattr(os, "geteuid") else None,
+            gid=os.getegid() if hasattr(os, "getegid") else None,
+            parent_exists=parent.exists(),
+            parent_writable=os.access(parent, os.W_OK),
+            error=str(exc),
+        ).error("database_open_failed")
     except Exception:
-        _logger.exception("SQLite open failed and diagnostics could not be collected")
+        logger.exception("database_diagnostics_failed")
 
 
 def _configure_conn(conn: sqlite3.Connection) -> None:
@@ -132,74 +120,6 @@ def _get_conn():
     return conn
 
 
-def _load_sarga_from_cache(kanda: int, sarga: int):
-    with _get_conn() as conn:
-        rows = conn.execute(
-            '''
-            SELECT sloka_index, sloka_num_text, sloka_text, bhaavam_en
-            FROM sarga_cache
-            WHERE kanda = ? AND sarga = ?
-            ORDER BY sloka_index
-            ''',
-            (kanda, sarga),
-        ).fetchall()
-    if not rows:
-        return None
-    slokas = []
-    for row in rows:
-        slokas.append(
-            {
-                'sloka_num': row['sloka_num_text'],
-                'sloka_text': row['sloka_text'],
-                'bhaavam_en': row['bhaavam_en'],
-                'pratipadaartham': {},
-            }
-        )
-    return CachedSarga(slokas)
-
-
-def _save_sarga_to_cache(kanda: int, sarga: int, sr: SargaReader) -> None:
-    slokas = sr.get_all_slokas()
-    rows = []
-    for idx, sloka in enumerate(slokas, start=1):
-        sloka_num_text = sloka.get('sloka_num') or f'{kanda}.{sarga}.{idx}'
-        rows.append(
-            (
-                kanda,
-                sarga,
-                idx,
-                sloka_num_text,
-                sloka.get('sloka_text', ''),
-                sloka.get('bhaavam_en', ''),
-            )
-        )
-    with _get_conn() as conn:
-        conn.execute(
-            'DELETE FROM sarga_cache WHERE kanda = ? AND sarga = ?',
-            (kanda, sarga),
-        )
-        conn.executemany(
-            '''
-            INSERT INTO sarga_cache (kanda, sarga, sloka_index, sloka_num_text, sloka_text, bhaavam_en)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''',
-            rows,
-        )
-
-
-def _record_sarga_len(kanda: int, sarga: int, sloka_count: int) -> None:
-    with _get_conn() as conn:
-        conn.execute(
-            '''
-            INSERT INTO sarga_stats (kanda, sarga, sloka_count)
-            VALUES (?, ?, ?)
-            ON CONFLICT(kanda, sarga) DO UPDATE SET
-                sloka_count = excluded.sloka_count
-            ''',
-            (kanda, sarga, sloka_count),
-        )
-
-
 def _get_sarga_len(kanda: int, sarga: int) -> int:
     with _get_conn() as conn:
         row = conn.execute(
@@ -210,7 +130,6 @@ def _get_sarga_len(kanda: int, sarga: int) -> int:
         return int(row['sloka_count'])
     sr = _get_sarga_reader(kanda, sarga)
     count = len(sr)
-    _record_sarga_len(kanda, sarga, count)
     return count
 
 
@@ -289,6 +208,12 @@ def _get_kanda_total_sargas(kanda: int) -> int:
     cached = stats_cache['kanda_sargas'].get(kanda)
     if cached is not None:
         return cached
+    available = [
+        sarga
+        for available_kanda, sarga in sarga_cache.available()
+        if available_kanda == kanda
+    ]
+    available_max = max(available, default=0)
     with _get_conn() as conn:
         total_row = conn.execute(
             'SELECT total_sargas FROM kanda_stats WHERE kanda = ?',
@@ -300,7 +225,7 @@ def _get_kanda_total_sargas(kanda: int) -> int:
             (kanda,),
         ).fetchone()
         max_sarga = int(row['max_sarga']) if row and row['max_sarga'] is not None else 0
-        total = max(total_from_stats, max_sarga)
+        total = max(total_from_stats, max_sarga, available_max)
         if total > 0:
             stats_cache['kanda_sargas'][kanda] = total
             return total
@@ -354,20 +279,31 @@ def _get_ramayana_progress_slokas(kanda: int, sarga: int, sloka_num: int) -> int
     return prefix + _get_kanda_progress_slokas(kanda, sarga, sloka_num)
 
 
-def _get_sarga_reader(kanda: int, sarga: int) -> SargaReader:
-    sr = sarga_readers.get((kanda, sarga))
-    if sr is not None:
-        return sr
-    sr = _load_sarga_from_cache(kanda, sarga)
-    if sr is not None:
-        sarga_readers[(kanda, sarga)] = sr
-        _record_sarga_len(kanda, sarga, len(sr))
-        return sr
-    sr = SargaReader(kanda, sarga, lang='te')
-    sarga_readers[(kanda, sarga)] = sr
-    _save_sarga_to_cache(kanda, sarga, sr)
-    _record_sarga_len(kanda, sarga, len(sr))
-    return sr
+def _get_sarga_reader(kanda: int, sarga: int):
+    return sarga_cache.get(kanda, sarga)
+
+
+def _log_database_state() -> None:
+    with _get_conn() as conn:
+        integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        sarga_count = conn.execute("SELECT COUNT(*) FROM sarga_stats").fetchone()[0]
+        cached_slokas = conn.execute("SELECT COUNT(*) FROM sarga_cache").fetchone()[0]
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    state = logger.bind(
+        event="database_ready",
+        database=str(db_path),
+        bytes=db_path.stat().st_size if db_path.exists() else 0,
+        integrity=integrity,
+        journal_mode=journal_mode,
+        sarga_count=sarga_count,
+        cached_slokas=cached_slokas,
+        user_count=user_count,
+    )
+    if integrity != "ok" or sarga_count == 0 or cached_slokas == 0:
+        state.warning("database_ready")
+    else:
+        state.info("database_ready")
 
 
 def _init_db():
@@ -462,6 +398,27 @@ def _init_db():
                 bhaavam_en TEXT NOT NULL,
                 PRIMARY KEY (kanda, sarga, sloka_index)
             )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS read_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                kanda INTEGER NOT NULL,
+                sarga INTEGER NOT NULL,
+                sloka_num INTEGER NOT NULL,
+                read_at INTEGER NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (thread_id) REFERENCES reading_threads(id) ON DELETE CASCADE
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE INDEX IF NOT EXISTS idx_read_events_user_time
+            ON read_events(user_id, read_at)
             '''
         )
         columns = conn.execute(
@@ -641,6 +598,53 @@ def _ensure_legacy_bookmarks() -> None:
             ''',
             (thread_id,),
         )
+
+
+def _record_read_event(user_id: int, thread_id: int, kanda: int, sarga: int, sloka_num: int) -> None:
+    now_ts = int(time.time())
+    cutoff = now_ts - (5 * 24 * 60 * 60)
+    with _get_conn() as conn:
+        conn.execute(
+            '''
+            INSERT INTO read_events (user_id, thread_id, kanda, sarga, sloka_num, read_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (user_id, thread_id, kanda, sarga, sloka_num, now_ts),
+        )
+        conn.execute(
+            'DELETE FROM read_events WHERE read_at < ?',
+            (cutoff,),
+        )
+
+
+def _get_recent_reads(user_id: int, days: int = 5) -> list[dict]:
+    days = max(1, min(days, 30))
+    cutoff = int(time.time()) - (days * 24 * 60 * 60)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            '''
+            SELECT r.thread_id, t.name AS thread_name, r.kanda, r.sarga, r.sloka_num, r.read_at
+            FROM read_events r
+            JOIN reading_threads t ON t.id = r.thread_id
+            WHERE r.user_id = ? AND r.read_at >= ?
+            ORDER BY r.read_at DESC
+            ''',
+            (user_id, cutoff),
+        ).fetchall()
+    items = []
+    for row in rows:
+        read_at = datetime.fromtimestamp(int(row['read_at']), tz=timezone.utc).isoformat()
+        items.append(
+            {
+                'thread_id': int(row['thread_id']),
+                'thread_name': row['thread_name'],
+                'kanda': int(row['kanda']),
+                'sarga': int(row['sarga']),
+                'sloka_num': int(row['sloka_num']),
+                'read_at': read_at,
+            }
+        )
+    return items
 
 
 def _is_bookmarked(thread_id: int, kanda: int, sarga: int, sloka_num: int) -> bool:
@@ -1003,6 +1007,8 @@ def _thread_card_fragment(thread):
 
 
 _init_db()
+sarga_cache = SargaCache(_get_conn, _data_dir / "sarga_cache")
+_log_database_state()
 
 
 @rt('/manifest.webmanifest')
@@ -1452,6 +1458,7 @@ def home(request: Request):
 @rt('/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num}')
 async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     """Display a single sloka with navigation."""
+    request_id = getattr(request.state, "request_id", "unknown")
     user_id = _get_user_id(request)
     is_anon = _is_anonymous(request)
     if not user_id and not is_anon:
@@ -1460,11 +1467,23 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     if user_id:
         thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     
-    # Get or create SargaReader for this sarga
+    # Load this sarga through the cache interface.
     try:
         sr = _get_sarga_reader(kanda, sarga)
-    except Exception as e:
-        return Response(f'Error loading sarga: {str(e)}', status_code=500)
+    except Exception as error:
+        logger.bind(
+            event="sloka_render_failed",
+            request_id=request_id,
+            kanda=kanda,
+            sarga=sarga,
+            sloka=sloka_num,
+            error_type=type(error).__name__,
+            error=str(error),
+        ).error("sloka_render_failed")
+        return Response(
+            f"Could not load this sarga. Error ID: {request_id}",
+            status_code=502,
+        )
     
     # Validate sloka number
     if sloka_num < 1 or sloka_num > len(sr):
@@ -1473,51 +1492,39 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
     # Get sloka data
     try:
         sloka_data = sr[sloka_num - 1]  # Convert to 0-based index
-    except Exception as e:
-        return Response(f'Error loading sloka: {str(e)}', status_code=500)
-    
-    # Calculate previous URL
-    if sloka_num > 1:
-        prev_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num-1}'
-    else:
-        # Need to go to previous sarga or previous kanda
-        if sarga > 1:
-            try:
-                prev_sr = _get_sarga_reader(kanda, sarga-1)
-            except Exception:
-                prev_sr = None
-            prev_url = f'/kanda/{kanda}/sarga/{sarga-1}/sloka/{len(prev_sr)}' if prev_sr else '#'
-        elif kanda > 1:
-            prev_kanda = kanda - 1
-            prev_sarga = _get_kanda_total_sargas(prev_kanda)
-            if prev_sarga <= 0:
-                prev_url = '#'
-            else:
-                try:
-                    prev_sr = _get_sarga_reader(prev_kanda, prev_sarga)
-                except Exception:
-                    prev_sr = None
-                prev_url = f'/kanda/{prev_kanda}/sarga/{prev_sarga}/sloka/{len(prev_sr)}' if prev_sr else '#'
-        else:
-            prev_url = '#'
-    
-    # Calculate next URL
-    if sloka_num < len(sr):
-        next_url = f'/kanda/{kanda}/sarga/{sarga}/sloka/{sloka_num+1}'
-    else:
-        total_sargas = _get_kanda_total_sargas(kanda)
-        if total_sargas and sarga >= total_sargas and kanda >= MAX_KANDA:
-            next_url = '#'
-        elif total_sargas and sarga >= total_sargas:
-            next_url = f'/kanda/{kanda+1}/sarga/1/sloka/1'
-        else:
-            # Go to next sarga
-            next_url = f'/kanda/{kanda}/sarga/{sarga+1}/sloka/1'
+    except Exception:
+        logger.bind(
+            event="sloka_data_failed",
+            request_id=request_id,
+            kanda=kanda,
+            sarga=sarga,
+            sloka=sloka_num,
+        ).exception("sloka_data_failed")
+        return Response(f"Could not load this sloka. Error ID: {request_id}", status_code=500)
+
+    position = ReadingPosition(kanda, sarga, sloka_num)
+    navigation = build_navigation(
+        position,
+        len(sr),
+        sarga_cache.previous(kanda, sarga) if sloka_num == 1 else None,
+        sarga_cache.next(kanda, sarga) if sloka_num == len(sr) else None,
+    )
+    prev_url = navigation.previous.path if navigation.previous else '#'
+    next_url = navigation.next.path if navigation.next else '#'
 
     if thread_id and prev_url != '#':
         prev_url = _with_thread(prev_url, thread_id)
     if thread_id and next_url != '#':
         next_url = _with_thread(next_url, thread_id)
+    logger.bind(
+        event="navigation_built",
+        request_id=request_id,
+        kanda=kanda,
+        sarga=sarga,
+        sloka=sloka_num,
+        previous=prev_url,
+        next=next_url,
+    ).info("navigation_built")
     
     # Render sloka content
     sloka_text = sloka_data['sloka_text']
@@ -1829,6 +1836,22 @@ async def sloka(kanda: int, sarga: int, sloka_num: int, request: Request):
                 });
 
                 document.addEventListener('htmx:afterSwap', refreshFsHint);
+                document.addEventListener('htmx:responseError', (event) => {
+                    const xhr = event.detail.xhr;
+                    const errorId = xhr.getResponseHeader('x-request-id') || 'unknown';
+                    console.error('navigation_failed', {
+                        status: xhr.status,
+                        errorId,
+                        path: event.detail.pathInfo.requestPath,
+                    });
+                    alert(`Could not load the next page. Error ID: ${errorId}`);
+                });
+                document.addEventListener('htmx:sendError', (event) => {
+                    console.error('navigation_request_failed', {
+                        path: event.detail.pathInfo.requestPath,
+                    });
+                    alert('Could not reach Valmiki. Check your connection and try again.');
+                });
                 refreshFsHint();
             '''),
         )
@@ -1859,7 +1882,29 @@ def mark_read(kanda: int, sarga: int, sloka_num: int, request: Request):
         return _login_redirect(request)
     thread_id = _resolve_thread_id(_parse_thread_id(request), user_id)
     _update_progress(thread_id, kanda, sarga, sloka_num)
+    _record_read_event(user_id, thread_id, kanda, sarga, sloka_num)
+    logger.bind(
+        event="read_recorded",
+        user_id=user_id,
+        thread_id=thread_id,
+        kanda=kanda,
+        sarga=sarga,
+        sloka=sloka_num,
+    ).info("read_recorded")
     return {'success': True}
+
+
+@rt('/api/reads/recent')
+def recent_reads(request: Request):
+    """Return current user's recent reads (default: last 5 days)."""
+    user_id = _get_user_id(request)
+    if not user_id:
+        if _is_anonymous(request):
+            return JSONResponse({'error': 'anonymous'}, status_code=403)
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    days = _parse_int(request.query_params.get('days'), 5)
+    items = _get_recent_reads(user_id, days)
+    return JSONResponse({'days': days, 'count': len(items), 'items': items})
 
 
 @rt('/bookmarks')
